@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# local secrets / captures
+token.json
+qwen-raw.log
+
+# agent scratch
+.opencode/
