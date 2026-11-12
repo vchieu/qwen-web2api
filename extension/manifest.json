@@ -1,0 +1,14 @@
+{
+  "manifest_version": 3,
+  "name": "Qwen Web2API Bridge",
+  "version": "1.0.0",
+  "description": "Runs Qwen upstream calls inside the real chat.qwen.ai tab for the local qwen-web2api proxy.",
+  "content_scripts": [
+    {
+      "matches": ["https://chat.qwen.ai/*"],
+      "js": ["bridge.js"],
+      "run_at": "document_idle",
+      "world": "MAIN"
+    }
+  ]
+}

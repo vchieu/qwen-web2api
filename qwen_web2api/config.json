@@ -1,0 +1,7 @@
+{
+  "port": 8081,
+  "bridge_enabled": true,
+  "bridge_port": 8083,
+  "default_model": "qwen3.7-plus",
+  "log_requests": true
+}
