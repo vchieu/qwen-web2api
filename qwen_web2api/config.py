@@ -10,7 +10,7 @@ DEFAULT_CONFIG = {
     # Browser bridge (extension-facing server).
     "bridge_port": 8083,
     "bridge_worker_ttl": 20,
-    "bridge_job_timeout": 300,
+    "bridge_job_timeout": 600,
     "bridge_poll_wait": 20,
 
     "api_keys": [],
@@ -49,7 +49,9 @@ def load_config(path=None):
 
 
 def find_config():
+    pkg_cfg = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
     for p in ("./config.json",
+              pkg_cfg,
               os.path.expanduser("~/.config/qwen-web2api/config.json")):
         if os.path.exists(p):
             return p

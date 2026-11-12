@@ -66,6 +66,17 @@ Luồng chat: `do_POST` → `_handle_chat` / `_handle_responses` →
 3. `refreshModels()` đọc `GET /api/v2/models` trong tab (throttle 10 phút) và
    gửi kèm `models` trong body `/poll`; Python merge vào `/v1/models`
    (`bridge.known_models()`).
+4. Parser: thinking thật từ upstream stream dưới dạng
+   `phase="thinking_summary"` với `extra.summary_thought` /
+   `extra.summary_title`; hỗ trợ cả mảng cumulative (Qwen thật) lẫn disjoint
+   block (`status:"finished"`). `_seenTitles` đảm bảo mỗi step title in đậm
+   **một lần duy nhất**. `on_reasoning_delta` stream thinking trực tiếp về
+   client qua SSE (kể cả khi `tools_active`). Send timeout được huỷ ngay khi
+   bắt được completion response, chuyển sang watchdog 3 phút idle reset theo
+   từng chunk để không bao giờ bị timeout khi Qwen suy nghĩ lâu. Ngoài ra vẫn
+   nhận `reasoning_content` / `phase=thinking|think|reasoning` nếu Qwen đổi lại
+   shape. Delta lạ được gửi `warn` (phase + keys) một lần và 20 dòng SSE gần
+   nhất chứa think/reason/summary in bằng `__qwenUIBridgeDebug()`.
 
 ## Kiểm tra UI thủ công
 

@@ -1101,6 +1101,30 @@ class TestServerTurn(_Sandbox):
                 h._run_turn("prompt", "m", False, False, None, None, None, True)
         self.assertIn("required tool call", str(ctx.exception))
 
+    def test_streaming_reasoning_deltas(self):
+        h = _bare_handler()
+        stream_events = [("reasoning", "Thinking step 1... "),
+                         ("reasoning", "Thinking step 2... "),
+                         ("content", "Final answer")]
+        reasoning_deltas = []
+
+        def on_reasoning(delta):
+            reasoning_deltas.append(delta)
+
+        def mock_generate_stream(prompt, model, think, usage_out=None, file_info=None):
+            if usage_out is not None:
+                usage_out.update({"prompt_tokens": 10})
+            yield from stream_events
+
+        with mock.patch.object(bridge, "generate_stream", side_effect=mock_generate_stream):
+            text, reasoning, calls, usage = h._run_turn(
+                "prompt", "m", True, False, None, None, None, False,
+                on_reasoning_delta=on_reasoning)
+        self.assertEqual(text, "Final answer")
+        self.assertEqual(reasoning, "Thinking step 1... Thinking step 2... ")
+        self.assertEqual(reasoning_deltas, ["Thinking step 1... ", "Thinking step 2... "])
+        self.assertEqual(usage.get("prompt_tokens"), 10)
+
 
 # ---------------------------------------------------------------- config ----
 class TestConfig(_Sandbox):

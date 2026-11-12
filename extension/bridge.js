@@ -14,7 +14,8 @@
   const BASE = location.origin;
   const MAX_JOBS = 1;
   const NEW_CHAT_EACH_JOB = true;   // thu bam New Chat truoc moi job
-  const SEND_TIMEOUT_MS = 180000;
+  const SEND_TIMEOUT_MS = 90000;    // Timeout de dien UI va cho completion response bat dau
+  const STREAM_IDLE_TIMEOUT_MS = 180000; // 3 phut khong co bat ky chunk nao moi coi la stream treo
   const COMPOSER_WAIT_MS = 15000;
   const MODEL_REFRESH_MS = 10 * 60 * 1000;
   const MODE_CHECK_MS = 5000;
@@ -22,10 +23,13 @@
   const MODE_NAV_WINDOW_MS = 60000;
   const MODE_NAV_MAX = 2;
 
+  let pageLoadedAsTemporary = /[?&]temporary-chat=true/.test(location.search)
+    || /[?&]temporary-chat=true/.test(location.href);
   let active = 0;
   let navigating = false;
   let current = null;
   let knownModels = [];
+  let lastRawDeltas = [];
   let lastModelRefresh = 0;
   let lastModeCheck = 0;
   let selectModelEnabled = true;
@@ -72,6 +76,27 @@
       .toLowerCase()
       .replace(/\.0\b/g, "")
       .replace(/[^a-z0-9]+/g, "");
+  }
+
+  // Qwen doi shape theo phase: string, mang part ({type,text}) hay object
+  // {content:[...]}. Gom ve 1 string de khong lam mat thinking.
+  function partsText(v) {
+    if (typeof v === "string") return v;
+    if (Array.isArray(v)) return v.map(partsText).join("");
+    if (v && typeof v === "object") {
+      if (typeof v.text === "string") return v.text;
+      if (v.content !== undefined) return partsText(v.content);
+    }
+    return "";
+  }
+
+  // Gom content cua summary (string | mang string | mang part | {content}) thanh
+  // 1 string, moi phan cach nhau bang `sep`.
+  function joinParts(v, sep) {
+    const raw = (v && typeof v === "object" && !Array.isArray(v)
+      && v.content !== undefined) ? v.content : v;
+    const list = Array.isArray(raw) ? raw : (raw == null ? [] : [raw]);
+    return list.map((p) => partsText(p).trim()).filter(Boolean).join(sep);
   }
 
   function labelMatches(targets, text) {
@@ -241,7 +266,21 @@
   }
 
   function isTemporaryPage() {
-    return /[?&]temporary-chat=true/.test(location.search);
+    if (pageLoadedAsTemporary) return true;
+    if (/[?&]temporary-chat=true/.test(location.search) || /[?&]temporary-chat=true/.test(location.href)) {
+      pageLoadedAsTemporary = true;
+      return true;
+    }
+    const tempEl = document.querySelector(
+      '[class*="temporary" i], [data-testid*="temporary" i], [aria-label*="temporary" i], [title*="temporary" i]'
+    );
+    if (tempEl && visible(tempEl)) return true;
+    const bodyText = (document.body && document.body.innerText) || "";
+    if (/temporary\s*chat\s*(is\s*on|enabled|bật|đang\s*bật)|cuộc\s*trò\s*chuyện\s*tạm\s*thời|临时对话/i.test(bodyText)) {
+      pageLoadedAsTemporary = true;
+      return true;
+    }
+    return false;
   }
 
   function modeUrl(want) {
@@ -368,6 +407,25 @@
     return true;
   }
 
+  // Chan doan: delta co du lieu la nhung khong key nao duoc doc -> bao 1 lan
+  // (kem phase + keys) de biet Qwen doi shape; xem __qwenUIBridgeDump().
+  function noteShape(job, phase, d) {
+    if (!job || !d || typeof d !== "object") return;
+    const keys = Object.keys(d).filter((k) => k !== "phase"
+      && k !== "status" && k !== "role");
+    if (!keys.length) return;
+    if (!keys.some((k) => k !== "content" && k !== "extra")) return;
+    if (partsText(d.content) || partsText(d.reasoning_content)
+        || (d.extra && partsText(d.extra.summary_thought))) return;
+    const sig = String(phase || "") + "|" + keys.join(",");
+    if (!job._shapes) job._shapes = new Set();
+    if (job._shapes.has(sig)) return;
+    job._shapes.add(sig);
+    send(job.id, { kind: "warn",
+      message: "delta khong doc duoc phase=" + (phase || "(none)")
+        + " keys=" + keys.join(",") });
+  }
+
   async function handleData(job, data) {
     if (!job || job.settled) return;
     if (!data || data === "[DONE]") {
@@ -383,13 +441,15 @@
     if (obj.ret) throw new Error(JSON.stringify(obj).slice(0, 300));
     if (obj.usage) await send(job.id, { kind: "usage", usage: obj.usage });
 
-    // Khởi tạo biến lưu text thinking cũ để tránh gửi trùng lặp (do Qwen hay gửi cumulative array)
-    if (typeof job._lastThought !== "string") job._lastThought = "";
-
     for (const ch of obj.choices || []) {
       const d = ch.delta || ch.message || {};
       const phase = d.phase || "";
       const status = d.status || "";
+      const thinkPhase = String(phase || "").toLowerCase();
+      const isSummary = thinkPhase.includes("summary");
+      const isThinking = !isSummary
+        && (thinkPhase === "thinking" || thinkPhase === "think"
+            || thinkPhase === "reasoning");
 
       // 0. Native function_call: Qwen đang gọi tool bằng structured call.
       // Chỉ can thiệp khi prompt có block "# Tool Use" (client khai báo tools);
@@ -414,57 +474,87 @@
         continue;
       }
 
-      // 1. Lấy Full Thinking (nếu Qwen trả về phase="thinking" hoặc có reasoning_content)
-      if (typeof d.reasoning_content === "string" && d.reasoning_content) {
-        await send(job.id, { kind: "delta", phase: "reasoning", text: d.reasoning_content });
-      } else if ((phase === "thinking" || phase === "think") && typeof d.content === "string" && d.content) {
-        await send(job.id, { kind: "delta", phase: "reasoning", text: d.content });
+      // 1. Full Thinking: reasoning_content, hoac content cua phase thinking
+      // (string | array parts deu duoc).
+      const reasoningText = partsText(d.reasoning_content);
+      if (reasoningText) {
+        await send(job.id, { kind: "delta", phase: "reasoning", text: reasoningText });
+      } else if (isThinking) {
+        const thinkText = partsText(d.content);
+        if (thinkText) {
+          await send(job.id, { kind: "delta", phase: "reasoning", text: thinkText });
+        }
       }
 
-      // 2. Lấy Summary Thinking (phase="thinking_summary")
-      if (phase === "thinking_summary" && d.extra) {
-        let thoughtText = "";
-        if (d.extra.summary_thought && Array.isArray(d.extra.summary_thought.content)) {
-          thoughtText = d.extra.summary_thought.content.join("");
-        } else if (typeof d.extra.summary_thought === "string") {
-          thoughtText = d.extra.summary_thought;
+      // 2. Summary Thinking:
+      if (isSummary) {
+        if (status === "finished") {
+          job._blockFinished = true;
+          continue;
         }
-        
-        // Lấy thêm Title (nếu có) để làm tiêu đề in đậm
-        let titleText = "";
-        if (d.extra.summary_title && Array.isArray(d.extra.summary_title.content)) {
-          titleText = d.extra.summary_title.content.join("");
+        const extra = d.extra || {};
+
+        // 2a. Title: in đậm từng step title khi xuất hiện
+        const rawTitles = (extra.summary_title && extra.summary_title.content !== undefined)
+          ? extra.summary_title.content : extra.summary_title;
+        const titleList = Array.isArray(rawTitles) ? rawTitles : (rawTitles ? [rawTitles] : []);
+        if (titleList.length > 0) {
+          if (!job._seenTitles) job._seenTitles = new Set();
+          for (const item of titleList) {
+            const t = partsText(item).trim();
+            if (t && !job._seenTitles.has(t)) {
+              job._seenTitles.add(t);
+              await send(job.id, {
+                kind: "delta",
+                phase: "reasoning",
+                text: `**${t}**\n\n`
+              });
+            }
+          }
         }
 
-        if (thoughtText && thoughtText !== job._lastThought) {
-          // Chỉ gửi phần text mới (delta) để tránh client bị lặp chữ
-          let delta = thoughtText.slice(job._lastThought.length);
-          job._lastThought = thoughtText;
-          
-          if (delta) {
-            // Nếu đây là chunk đầu tiên và có title, prepend title vào
-            if (job._lastThought === thoughtText && titleText && !job._titleSent) {
-               delta = `**${titleText}**\n\n${delta}`;
-               job._titleSent = true;
+        // 2b. Thought: xử lý cumulative arrays hoặc disjoint blocks
+        const thoughtText = joinParts(extra.summary_thought, "\n\n");
+        if (typeof job._thinkThought !== "string") job._thinkThought = "";
+        if (thoughtText && thoughtText !== job._thinkThought) {
+          let delta = "";
+          if (job._thinkThought && thoughtText.startsWith(job._thinkThought)) {
+            delta = thoughtText.slice(job._thinkThought.length);
+            job._thinkThought = thoughtText;
+          } else if (job._blockFinished && !thoughtText.startsWith(job._thinkThought)) {
+            delta = "\n\n" + thoughtText;
+            job._thinkThought = (job._thinkThought ? job._thinkThought + "\n\n" : "") + thoughtText;
+          } else if (!job._thinkThought) {
+            delta = thoughtText;
+            job._thinkThought = thoughtText;
+          } else {
+            // Tiền tố có khác biệt nhỏ: tìm common prefix
+            let p = 0;
+            while (p < job._thinkThought.length && p < thoughtText.length
+                   && job._thinkThought[p] === thoughtText[p]) {
+              p++;
             }
+            delta = thoughtText.slice(p);
+            job._thinkThought = thoughtText;
+          }
+          job._blockFinished = false;
+          if (delta) {
             await send(job.id, { kind: "delta", phase: "reasoning", text: delta });
           }
         }
+        continue;
       }
 
-      // 3. Lấy Final Answer (phase="answer" hoặc không có phase)
-      const isAnswer = phase === "answer" || phase === "" || !phase;
+      // 3. Final Answer: moi phase khong phai thinking/summary deu la answer.
+      const isAnswer = !isThinking && !isSummary;
       if (isAnswer) {
-        if (typeof d.content === "string" && d.content) {
-          await send(job.id, { kind: "delta", phase: "content", text: d.content });
-        } else if (Array.isArray(d.content)) {
-          for (const p of d.content) {
-            if (p && typeof p.text === "string" && p.text) {
-              await send(job.id, { kind: "delta", phase: "content", text: p.text });
-            }
-          }
+        const answerText = partsText(d.content);
+        if (answerText) {
+          await send(job.id, { kind: "delta", phase: "content", text: answerText });
         }
       }
+
+      noteShape(job, phase, d);
     }
   }
 
@@ -474,21 +564,40 @@
       const text = await resp.text();
       throw new Error("non-SSE (" + resp.status + "): " + text.slice(0, 400));
     }
+
+    let idleTimer = null;
+    const resetIdleTimer = () => {
+      if (idleTimer) clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => {
+        settle(job, new Error("Upstream stream timeout: khong nhan duoc du lieu tu Qwen sau " + (STREAM_IDLE_TIMEOUT_MS / 1000) + "s"));
+      }, STREAM_IDLE_TIMEOUT_MS);
+    };
+    resetIdleTimer();
+
     const reader = resp.body.getReader();
     const dec = new TextDecoder();
     let buf = "";
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      if (job.settled) break;
-      buf += dec.decode(value, { stream: true });
-      let idx;
-      while ((idx = buf.indexOf("\n")) >= 0) {
-        const line = buf.slice(0, idx).trim();
-        buf = buf.slice(idx + 1);
-        if (!line.startsWith("data:")) continue;
-        await handleData(job, line.slice(5).trim());
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (job.settled) break;
+        resetIdleTimer();
+        buf += dec.decode(value, { stream: true });
+        let idx;
+        while ((idx = buf.indexOf("\n")) >= 0) {
+          const line = buf.slice(0, idx).trim();
+          buf = buf.slice(idx + 1);
+          if (!line.startsWith("data:")) continue;
+          if (/think|reason|summar/i.test(line)) {
+            lastRawDeltas.push(line.slice(0, 500));
+            if (lastRawDeltas.length > 20) lastRawDeltas.shift();
+          }
+          await handleData(job, line.slice(5).trim());
+        }
       }
+    } finally {
+      if (idleTimer) clearTimeout(idleTimer);
     }
     settle(job, null);
   }
@@ -510,6 +619,9 @@
     try {
       if (current && !current.attached && isCompletionURL(urlOf(input))) {
         current.attached = true;
+        if (typeof current._clearSendTimer === "function") {
+          current._clearSendTimer();
+        }
         const clone = resp.clone();
         pumpFetch(current, clone).catch((e) => settle(current, e));
       }
@@ -527,6 +639,9 @@
   XMLHttpRequest.prototype.send = function (body) {
     if (current && !current.attached && isCompletionURL(this.__qwenURL)) {
       current.attached = true;
+      if (typeof current._clearSendTimer === "function") {
+        current._clearSendTimer();
+      }
       const job = current;
       this.addEventListener("load", () => {
         parseSSEText(job, this.responseText).catch((e) => settle(job, e));
@@ -613,9 +728,15 @@
 
   async function tryNewChat() {
     if (!NEW_CHAT_EACH_JOB) return;
+    const st = await readStatus();
+    const wantTemp = st && st.temporary_chat;
     const btn = findNewChatButton();
     if (!btn) {
       log("khong tim thay nut New Chat; se gui trong chat hien tai");
+      return;
+    }
+    if (wantTemp && btn.tagName === "A" && btn.getAttribute("href") === "/") {
+      log("dang o temporary chat mode; khong click link href=/ de tranh thoat temporary");
       return;
     }
     btn.click();
@@ -860,9 +981,15 @@
 
   async function runJob(job) {
     current = job;
-    const timer = setTimeout(() => {
+    let sendTimer = setTimeout(() => {
       settle(job, new Error("UI send timeout: khong bat duoc completion response"));
     }, SEND_TIMEOUT_MS);
+    job._clearSendTimer = () => {
+      if (sendTimer) {
+        clearTimeout(sendTimer);
+        sendTimer = null;
+      }
+    };
     try {
       await tryNewChat();
       if (!(await ensureMode(job))) return;
@@ -881,7 +1008,7 @@
     } catch (e) {
       settle(job, e);
     } finally {
-      clearTimeout(timer);
+      if (typeof job._clearSendTimer === "function") job._clearSendTimer();
       current = null;
     }
   }
@@ -933,6 +1060,7 @@
     const trigger = findModelTrigger(
       knownModels.map((m) => m.id || "").filter(Boolean));
     console.log("model trigger:", trigger, trigger ? textOf(trigger) : "");
+    console.log("last raw thinking deltas:", lastRawDeltas);
   };
 
   loop();

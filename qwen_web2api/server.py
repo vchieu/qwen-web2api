@@ -445,7 +445,7 @@ class QwenHandler(BaseHTTPRequestHandler):
     # ---------------------------------------------------------- tool turn --
     def _run_turn(self, prompt, upstream, think, tools_active, allowed,
                   schemas, required_params, required_tool, client_gone=None,
-                  file_info=None):
+                  file_info=None, on_reasoning_delta=None):
         attempts = 1
         if required_tool or (tools_active and CONFIG.get("tool_retry_on_miss")):
             attempts = 1 + max(0, int(CONFIG.get("tool_retry_attempts", 1)))
@@ -456,9 +456,25 @@ class QwenHandler(BaseHTTPRequestHandler):
                 log("tool retry skipped: client disconnected")
                 break
             call_prompt = prompt + nudge if nudge else prompt
-            result = bridge.generate(call_prompt, upstream, think, file_info=file_info)
-            text, reasoning, usage = (result["content"], result["reasoning"],
-                                      result["usage"])
+            if on_reasoning_delta:
+                content_parts = []
+                reasoning_parts = []
+                usage = {}
+                for kind, delta in bridge.generate_stream(
+                        call_prompt, upstream, think, usage, file_info=file_info):
+                    if client_gone is not None and client_gone.is_set():
+                        break
+                    if kind == "reasoning":
+                        reasoning_parts.append(delta)
+                        on_reasoning_delta(delta)
+                    else:
+                        content_parts.append(delta)
+                text = "".join(content_parts)
+                reasoning = "".join(reasoning_parts)
+            else:
+                result = bridge.generate(call_prompt, upstream, think, file_info=file_info)
+                text, reasoning, usage = (result["content"], result["reasoning"],
+                                          result["usage"])
             calls = None
             if tools_active and text:
                 text, calls, _dropped = parse_tool_calls(text, allowed, schemas)
@@ -624,14 +640,23 @@ class QwenHandler(BaseHTTPRequestHandler):
                                      file_info=file_info)
 
         stop_ping = gone = None
+        streamed_reasoning = []
         if stream:
             stop_ping, gone, _hb = self._start_sse()
             self._sse_chunk(cid, echo, {"role": "assistant", "content": ""},
                             None, include_usage)
+
+        def on_reasoning_delta(delta):
+            if stream and delta:
+                streamed_reasoning.append(delta)
+                self._sse_chunk(cid, echo, {"reasoning_content": delta},
+                                None, include_usage)
+
         try:
             text, reasoning, calls, usage = self._run_turn(
                 prompt, upstream, think, tools_active, allowed, schemas,
-                required_params, required_tool, gone, file_info=file_info)
+                required_params, required_tool, gone, file_info=file_info,
+                on_reasoning_delta=on_reasoning_delta if stream else None)
         except Exception as e:
             if stream:
                 try:
@@ -670,7 +695,13 @@ class QwenHandler(BaseHTTPRequestHandler):
         finish = "tool_calls" if calls else ("length" if truncated else "stop")
         if stream:
             try:
-                if reasoning:
+                streamed_len = sum(len(x) for x in streamed_reasoning)
+                if reasoning and len(reasoning) > streamed_len:
+                    extra = reasoning[streamed_len:]
+                    if extra:
+                        self._sse_chunk(cid, echo, {"reasoning_content": extra},
+                                        None, include_usage)
+                elif reasoning and not streamed_reasoning:
                     self._sse_chunk(cid, echo, {"reasoning_content": reasoning},
                                     None, include_usage)
                 if text:
@@ -835,10 +866,16 @@ class QwenHandler(BaseHTTPRequestHandler):
             stop_ping, gone, _hb = self._start_sse()
             emit("response.created", response=resp_obj("in_progress", [], None))
             emit("response.in_progress", response=resp_obj("in_progress", [], None))
+
+        def on_resp_reasoning(delta):
+            if stream and delta:
+                emit("response.reasoning_text.delta", delta=delta)
+
         try:
             text, _reasoning, calls, usage = self._run_turn(
                 prompt, upstream, think, tools_active, allowed, schemas,
-                required_params, required_tool, gone, file_info=file_info)
+                required_params, required_tool, gone, file_info=file_info,
+                on_reasoning_delta=on_resp_reasoning if stream else None)
         except Exception as e:
             if stream:
                 try:
