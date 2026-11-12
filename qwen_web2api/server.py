@@ -5,6 +5,9 @@ import threading
 import time
 import urllib.parse
 import uuid
+import tempfile
+import os
+import glob
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
 
@@ -21,6 +24,7 @@ ERR_INVALID = "invalid_request_error"
 ERR_API = "api_error"
 ERR_RATE = "rate_limit_error"
 SSE_PING_INTERVAL = 5
+MAX_PROMPT_CHARS = 130000  # buffer an toàn dưới giới hạn 131072 ký tự của Qwen Web
 
 
 def _usage(prompt, text, upstream=None):
@@ -67,6 +71,66 @@ def _apply_max_tokens(text, max_tokens):
     if len(text) > limit:
         return text[:limit], True
     return text, False
+
+
+def _cleanup_old_temp_files(max_age_sec=3600):
+    """Xóa các file qwen_prompt_* tạm đã tồn tại quá max_age_sec.
+    Tránh rác tồn đọng khi bridge.js crash / user đóng tab giữa chừng."""
+    try:
+        tmpdir = tempfile.gettempdir()
+        now = time.time()
+        for path in glob.glob(os.path.join(tmpdir, "qwen_prompt_*")):
+            try:
+                if now - os.path.getmtime(path) > max_age_sec:
+                    os.unlink(path)
+            except OSError:
+                pass
+    except Exception as e:
+        log(f"[bridge] temp cleanup error: {e}")
+
+
+def prepare_large_prompt(messages, tools=None, tool_choice=None):
+    """Nếu prompt đã render (gồm cả tool block) vượt MAX_PROMPT_CHARS,
+    ghi nguyên prompt vào file .txt tạm và trả về (file_info, short_messages).
+    Nếu không vượt, trả về (None, messages gốc).
+
+    Dùng đúng prompt mà bridge sẽ gửi (messages_to_prompt) để không bỏ sót
+    tool definitions/instructions khi tách sang attachment."""
+    full_prompt = messages_to_prompt(messages, tools, tool_choice)
+    if len(full_prompt) <= MAX_PROMPT_CHARS:
+        return None, messages
+
+    # Dọn file tạm cũ trước khi tạo file mới
+    _cleanup_old_temp_files()
+
+    fd, path = tempfile.mkstemp(suffix=".txt", prefix="qwen_prompt_")
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(full_prompt)
+
+    file_info = {
+        "path": path,
+        "filename": os.path.basename(path),
+        "size": len(full_prompt),
+    }
+
+    short_messages = [{
+        "role": "user",
+        "content": (
+            f"[Attached file: {file_info['filename']}]\n"
+            f"Please read and respond to the content in the attached file."
+        ),
+    }]
+    return file_info, short_messages
+
+
+def _remove_prompt_file(file_info):
+    """Xóa file prompt tạm sau khi lượt gọi kết thúc (kể cả khi retry)."""
+    path = (file_info or {}).get("path")
+    if path:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
 
 
 def _text_format(text_field):
@@ -379,7 +443,8 @@ class QwenHandler(BaseHTTPRequestHandler):
 
     # ---------------------------------------------------------- tool turn --
     def _run_turn(self, prompt, upstream, think, tools_active, allowed,
-                  schemas, required_params, required_tool, client_gone=None):
+                  schemas, required_params, required_tool, client_gone=None,
+                  file_info=None):
         attempts = 1
         if required_tool or (tools_active and CONFIG.get("tool_retry_on_miss")):
             attempts = 1 + max(0, int(CONFIG.get("tool_retry_attempts", 1)))
@@ -390,7 +455,7 @@ class QwenHandler(BaseHTTPRequestHandler):
                 log("tool retry skipped: client disconnected")
                 break
             call_prompt = prompt + nudge if nudge else prompt
-            result = generate(call_prompt, upstream, think)
+            result = generate(call_prompt, upstream, think, file_info=file_info)
             text, reasoning, usage = (result["content"], result["reasoning"],
                                       result["usage"])
             calls = None
@@ -407,6 +472,12 @@ class QwenHandler(BaseHTTPRequestHandler):
                 if missing:
                     raise QwenError("model emitted invalid tool call; missing: "
                                     + ", ".join(missing))
+                # Prose lẫn với tool_call: coi phần prose là suy nghĩ, không
+                # trả về content (client chỉ cần tool_calls ở lượt này).
+                if text and text.strip():
+                    prose = text.strip()
+                    reasoning = f"{reasoning.rstrip()}\n\n{prose}" if reasoning else prose
+                    text = ""
                 return text, reasoning, calls, usage
             if required_tool:
                 nudge = "\n\nIMPORTANT: Respond with a tool_call block ONLY."
@@ -515,12 +586,20 @@ class QwenHandler(BaseHTTPRequestHandler):
         messages = req.get("messages", [])
         if not isinstance(messages, list):
             return self.send_api_error(400, "messages must be a list", ERR_INVALID)
+
         n = req.get("n", 1)
         if isinstance(n, int) and n > 1:
             return self.send_api_error(400, "n>1 is not supported",
                                        ERR_INVALID, "unsupported_value")
         tools = req.get("tools")
         tool_choice = req.get("tool_choice", "auto")
+
+        # Detect prompt lớn và tạo file tạm nếu cần (prepare_large_prompt tự check ngưỡng)
+        file_info, messages = prepare_large_prompt(messages, tools, tool_choice)
+        if file_info:
+            log(f"[bridge] large prompt detected ({file_info['size']} chars), "
+                f"created file: {file_info['filename']}")
+
         prompt = messages_to_prompt(messages, tools, tool_choice)
         rf = build_response_format_instruction(req.get("response_format"))
         if rf:
@@ -540,7 +619,8 @@ class QwenHandler(BaseHTTPRequestHandler):
 
         if stream and not rf and not tools_active:
             return self._stream_chat(cid, echo, prompt, upstream, think,
-                                     stops, max_tokens, include_usage)
+                                     stops, max_tokens, include_usage,
+                                     file_info=file_info)
 
         stop_ping = gone = None
         if stream:
@@ -550,7 +630,7 @@ class QwenHandler(BaseHTTPRequestHandler):
         try:
             text, reasoning, calls, usage = self._run_turn(
                 prompt, upstream, think, tools_active, allowed, schemas,
-                required_params, required_tool, gone)
+                required_params, required_tool, gone, file_info=file_info)
         except Exception as e:
             if stream:
                 try:
@@ -566,6 +646,7 @@ class QwenHandler(BaseHTTPRequestHandler):
         finally:
             if stop_ping:
                 stop_ping()
+            _remove_prompt_file(file_info)
 
         if rf and text:
             text = strip_code_fence(text)
@@ -613,13 +694,13 @@ class QwenHandler(BaseHTTPRequestHandler):
         })
 
     def _stream_chat(self, cid, model, prompt, upstream, think,
-                     stops, max_tokens, include_usage):
+                     stops, max_tokens, include_usage, file_info=None):
         stop_ping, _gone, _hb = self._start_sse()
         self._sse_chunk(cid, model, {"role": "assistant", "content": ""},
                         None, include_usage)
         full, finish, buf = "", "stop", ""
         hold = max((len(s) for s in stops), default=0)
-        gen = generate_stream(prompt, upstream, think)
+        gen = generate_stream(prompt, upstream, think, file_info=file_info)
         try:
             for kind, delta in gen:
                 if kind == "reasoning":
@@ -678,6 +759,7 @@ class QwenHandler(BaseHTTPRequestHandler):
             return
         finally:
             stop_ping()
+            _remove_prompt_file(file_info)
             close = getattr(gen, "close", None)
             if close:
                 try:
@@ -701,6 +783,13 @@ class QwenHandler(BaseHTTPRequestHandler):
         tools = _norm_resp_tools(req.get("tools"))
         messages = _responses_messages(req.get("input", []), req.get("instructions"))
         tool_choice = req.get("tool_choice") or "auto"
+
+        # Detect prompt lớn và tạo file tạm nếu cần (Responses API)
+        file_info, messages = prepare_large_prompt(messages, tools, tool_choice)
+        if file_info:
+            log(f"[bridge] large prompt detected ({file_info['size']} chars), "
+                f"created file: {file_info['filename']}")
+
         prompt = messages_to_prompt(messages, tools, tool_choice)
         rf = req.get("response_format") or _text_format(req.get("text"))
         rfi = build_response_format_instruction(rf)
@@ -748,7 +837,7 @@ class QwenHandler(BaseHTTPRequestHandler):
         try:
             text, _reasoning, calls, usage = self._run_turn(
                 prompt, upstream, think, tools_active, allowed, schemas,
-                required_params, required_tool, gone)
+                required_params, required_tool, gone, file_info=file_info)
         except Exception as e:
             if stream:
                 try:
@@ -765,6 +854,7 @@ class QwenHandler(BaseHTTPRequestHandler):
         finally:
             if stop_ping:
                 stop_ping()
+            _remove_prompt_file(file_info)
 
         if rfi and text:
             text = strip_code_fence(text)

@@ -13,6 +13,8 @@ import queue
 import threading
 import time
 import uuid
+import tempfile
+import os
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
 
@@ -69,8 +71,12 @@ class _Tracker:
         return delta
 
 
-def generate_stream(prompt, model, think, usage_out=None):
-    """Yield (kind, text) -- cung interface voi qwen.generate_stream."""
+def generate_stream(prompt, model, think, usage_out=None, file_info=None):
+    """Yield (kind, text) -- cung interface voi qwen.generate_stream.
+
+    file_info (dict, optional): thông tin file tạm chứa prompt quá dài,
+    bridge.js sẽ upload file này qua UI trước khi gửi message ngắn.
+    """
     attempts = max(1, int(CONFIG.get("retry_attempts", 2)))
     timeout = float(CONFIG.get("bridge_job_timeout", 300))
     last_err = None
@@ -86,7 +92,8 @@ def generate_stream(prompt, model, think, usage_out=None):
         with _lock:
             _jobs[jid] = q
         _pending.put({"job_id": jid, "model": model, "prompt": prompt,
-                      "think": bool(think), "ts": time.time()})
+                      "think": bool(think), "ts": time.time(),
+                      "file_info": file_info})
         tracker = _Tracker()
         emitted = False
         try:
@@ -106,6 +113,29 @@ def generate_stream(prompt, model, think, usage_out=None):
                         if d:
                             emitted = True
                             yield k, d
+                elif kind == "tool_call":
+                    # Native function_call từ Qwen (extension bắt được) ->
+                    # chuyển thành text fence để server.parse_tool_calls xử lý.
+                    if "# Tool Use" not in (prompt or ""):
+                        continue
+                    name = ev.get("name") or ""
+                    args = ev.get("arguments")
+                    if isinstance(args, str):
+                        try:
+                            args = json.loads(args, strict=False)
+                        except ValueError:
+                            pass
+                    if not isinstance(args, (dict, str)):
+                        args = "{}"
+                    if isinstance(args, str) and not args.strip():
+                        args = "{}"
+                    if name:
+                        block = json.dumps({"name": name, "arguments": args},
+                                           ensure_ascii=False)
+                        d = tracker.feed("content", f"\n```tool_call\n{block}\n```\n")
+                        if d:
+                            emitted = True
+                            yield "content", d
                 elif kind == "usage":
                     if usage_out is not None and isinstance(ev.get("usage"), dict):
                         usage_out.update(ev["usage"])
@@ -132,10 +162,10 @@ def generate_stream(prompt, model, think, usage_out=None):
     raise last_err
 
 
-def generate(prompt, model, think):
+def generate(prompt, model, think, file_info=None):
     t0 = time.monotonic()
     usage, content, reasoning = {}, [], []
-    for kind, text in generate_stream(prompt, model, think, usage):
+    for kind, text in generate_stream(prompt, model, think, usage, file_info=file_info):
         (reasoning if kind == "reasoning" else content).append(text)
     out = {"content": "".join(content), "reasoning": "".join(reasoning),
            "usage": usage}
@@ -175,7 +205,38 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
-        if self.path.split("?")[0].rstrip("/") == "/status":
+        path = self.path.split("?")[0].rstrip("/")
+
+        # Serve file prompt tạm được tạo bởi server.py khi prompt quá dài
+        if path.startswith("/file/"):
+            filename = os.path.basename(path[len("/file/"):])
+            if not filename.startswith("qwen_prompt_"):
+                return self._json({"error": "invalid file"}, 400)
+
+            tmpdir = os.path.abspath(tempfile.gettempdir())
+            filepath = os.path.join(tmpdir, filename)
+
+            # Chỉ serve khi file nằm trực tiếp trong tmpdir
+            if (os.path.exists(filepath)
+                    and os.path.dirname(os.path.abspath(filepath)) == tmpdir):
+                try:
+                    with open(filepath, "rb") as f:
+                        content = f.read()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/plain")
+                    self.send_header("Content-Length", str(len(content)))
+                    self.send_header("Access-Control-Allow-Origin", "*")
+                    self.end_headers()
+                    self.wfile.write(content)
+                    # Khong xoa tai day: server co the retry cung file_info
+                    # (tool retry), va server.py tu don file sau khi luot goi xong.
+                    return
+                except Exception as e:
+                    _log(f"file serve error: {e}")
+            self._json({"error": "not found"}, 404)
+            return
+
+        if path == "/status":
             return self._json(status())
         self._json({"error": "not found"}, 404)
 

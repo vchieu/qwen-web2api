@@ -423,11 +423,8 @@ def parse_tool_calls(text, allowed_names=None, tool_schemas=None):
         clean_parts.append(text[last_end:start])
         last_end = end
         calls.append(parsed)
-    if calls:
-        clean = "".join(clean_parts)
-    else:
-        clean_parts.append(text[last_end:])
-        clean = "".join(clean_parts)
+    clean_parts.append(text[last_end:])
+    clean = "".join(clean_parts)
     return clean.strip(), calls, dropped
 
 

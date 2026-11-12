@@ -58,10 +58,51 @@
     return String(input);
   }
 
+  // Qwen đôi khi gọi tool bằng native function_call thay vì text fence.
+  // Gom name + arguments (Qwen stream cumulative) rồi trả cho proxy để client
+  // tự chạy tool, KHÔNG để Qwen tự chạy tool trong sandbox của nó.
+  function collectNativeCall(job, fc) {
+    if (!fc) return;
+    const name = typeof fc.name === "string" ? fc.name : "";
+    const raw = typeof fc.arguments === "string"
+      ? fc.arguments
+      : (fc.arguments ? JSON.stringify(fc.arguments) : "");
+    if (!Array.isArray(job._nativeCalls)) job._nativeCalls = [];
+    let call = job._nativeCalls[job._nativeCalls.length - 1];
+    // Tên mới => call mới (Qwen stream tuần tự từng call)
+    if (!call || (name && call.name && call.name !== name)) {
+      call = { name: name, arguments: "" };
+      job._nativeCalls.push(call);
+    } else if (name) {
+      call.name = name;
+    }
+    if (!raw) return;
+    const prev = call.arguments || "";
+    if (!prev) call.arguments = raw;
+    else if (raw.startsWith(prev)) call.arguments = raw;   // cumulative
+    else call.arguments = prev + raw;                      // incremental
+  }
+
+  async function flushNativeCalls(job) {
+    const calls = job._nativeCalls || [];
+    job._nativeCalls = [];
+    const ready = calls.filter((c) => c && c.name);
+    if (!ready.length) return false;
+    for (const c of ready) {
+      await send(job.id, {
+        kind: "tool_call",
+        name: c.name,
+        arguments: c.arguments || "{}",
+      });
+    }
+    settle(job, null);
+    return true;
+  }
+
   async function handleData(job, data) {
     if (!job || job.settled) return;
     if (!data || data === "[DONE]") {
-      if (data === "[DONE]") settle(job, null);
+      if (data === "[DONE]" && !(await flushNativeCalls(job))) settle(job, null);
       return;
     }
     let obj;
@@ -80,6 +121,29 @@
       const d = ch.delta || ch.message || {};
       const phase = d.phase || "";
       const status = d.status || "";
+
+      // 0. Native function_call: Qwen đang gọi tool bằng structured call.
+      // Chỉ can thiệp khi prompt có block "# Tool Use" (client khai báo tools);
+      // function_call của tool built-in (web search...) để Qwen tự xử lý.
+      if (d.function_call) {
+        if (job.toolsActive) collectNativeCall(job, d.function_call);
+        continue;
+      }
+
+      // Qwen tự chạy tool và trả kết quả ở role="function" (thường là
+      // "Tool X does not exists."). Không forward rác này; trả call đã gom
+      // cho client thay vì để Qwen xử lý tiếp.
+      if (d.role === "function") {
+        if (job.toolsActive) await flushNativeCalls(job);
+        continue;
+      }
+
+      if (status === "finished" && (phase === "answer" || !phase)
+          && job.toolsActive && Array.isArray(job._nativeCalls)
+          && job._nativeCalls.length) {
+        await flushNativeCalls(job);
+        continue;
+      }
 
       // 1. Lấy Full Thinking (nếu Qwen trả về phase="thinking" hoặc có reasoning_content)
       if (typeof d.reasoning_content === "string" && d.reasoning_content) {
@@ -329,6 +393,202 @@
     if (btn2) btn2.click();
   }
 
+  function composerText(el) {
+    if (!el) return "";
+    if (el.isContentEditable) return String(el.innerText || el.textContent || "");
+    return String(el.value || "");
+  }
+
+  // Chụp nhanh các node trông giống attachment để biết paste/upload có tạo file mới.
+  function attachmentSnapshot() {
+    const sel = '[class*="file" i], [class*="attach" i], [class*="upload" i], '
+      + '[class*="document" i], [class*="doc" i], [class*="chip" i], '
+      + '[data-testid*="file" i], [data-testid*="attach" i], '
+      + '[data-testid*="document" i]';
+    return new Set(Array.from(document.querySelectorAll(sel)).filter(visible));
+  }
+
+  // Chờ Qwen tạo attachment từ text vừa paste. Ngoài việc xuất hiện node mới,
+  // còn dấu hiệu text trong composer bị rút ngắn (paste -> document).
+  async function waitForAttachment(composer, before, pastedLen, timeoutMs) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const added = Array.from(attachmentSnapshot()).some((n) => !before.has(n));
+      if (added) return true;
+      if (pastedLen > 500) {
+        const now = composerText(composer).trim().length;
+        if (now < Math.max(200, pastedLen / 2)) return true;
+      }
+      await sleep(400);
+    }
+    return false;
+  }
+
+  // Xóa sạch composer (contenteditable lẫn input/textarea).
+  function clearComposer(el) {
+    el.focus();
+    if (el.isContentEditable) {
+      document.execCommand("selectAll", false, null);
+      document.execCommand("delete", false, null);
+      if (composerText(el).trim()) {
+        el.textContent = "";
+        el.dispatchEvent(new InputEvent("input", {
+          bubbles: true,
+          inputType: "deleteContentBackward",
+        }));
+      }
+      return;
+    }
+    const proto = el.tagName === "TEXTAREA"
+      ? HTMLTextAreaElement.prototype
+      : HTMLInputElement.prototype;
+    const setter = Object.getOwnPropertyDescriptor(proto, "value")?.set;
+    if (setter) setter.call(el, "");
+    else el.value = "";
+    el.dispatchEvent(new Event("input", { bubbles: true }));
+    el.dispatchEvent(new Event("change", { bubbles: true }));
+  }
+
+  // Thay text cũ bằng prompt ngắn; editor đôi khi giữ text cũ sau lần đầu nên
+  // kiểm tra độ dài và xóa lại nếu cần.
+  function setComposerClean(el, text) {
+    clearComposer(el);
+    setComposer(el, text);
+    if (composerText(el).trim().length > text.length + 200) {
+      clearComposer(el);
+      setComposer(el, text);
+    }
+  }
+
+  // Qwen UI biến text dài được paste thành document/txt. Mô phỏng đúng thao tác
+  // Ctrl-V thay vì chèn file bằng tay (React thường bỏ qua file inject).
+  async function pasteLongText(composer, text) {
+    composer.focus();
+    try {
+      const dt = new DataTransfer();
+      dt.setData("text/plain", text);
+      composer.dispatchEvent(new ClipboardEvent("paste", {
+        clipboardData: dt,
+        bubbles: true,
+        cancelable: true,
+      }));
+    } catch (e) {
+      log("paste event failed:", e);
+    }
+    await sleep(2000);
+  }
+
+  async function fetchPromptText(fileInfo) {
+    const response = await fetch(`${BRIDGE}/file/${encodeURIComponent(fileInfo.filename)}`);
+    if (!response.ok) {
+      throw new Error("khong fetch duoc file tu bridge: " + response.status);
+    }
+    return await response.text();
+  }
+
+  // Fallback: đẩy file qua input[type=file] của Qwen UI.
+  async function uploadFileViaUI(fileInfo, text) {
+    log("uploading large prompt file:", fileInfo.filename);
+    const file = new File([text], fileInfo.filename, { type: "text/plain" });
+
+    let fileInput = document.querySelector('input[type="file"]');
+    if (!fileInput) {
+      // Click nút attachment (kẹp giấy) để UI sinh ra input[type="file"]
+      const attachBtn = document.querySelector(
+        '[aria-label*="Attach" i], [aria-label*="Đính kèm" i], [aria-label*="dính kèm" i], [data-testid*="attach" i]'
+      );
+      if (attachBtn) {
+        attachBtn.click();
+        await sleep(500);
+        fileInput = document.querySelector('input[type="file"]');
+      }
+    }
+    if (!fileInput) {
+      log("khong tim thay input[type=file] cua Qwen UI");
+      return false;
+    }
+
+    const dataTransfer = new DataTransfer();
+    dataTransfer.items.add(file);
+    const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
+      window.HTMLInputElement.prototype, "files"
+    )?.set;
+    if (nativeInputValueSetter) {
+      nativeInputValueSetter.call(fileInput, dataTransfer.files);
+    } else {
+      fileInput.files = dataTransfer.files;
+    }
+    fileInput.dispatchEvent(new Event("change", { bubbles: true }));
+    fileInput.dispatchEvent(new Event("input", { bubbles: true }));
+    await sleep(2000);
+    return true;
+  }
+
+  // Prompt quá dài: paste để Qwen tự tạo document txt; nếu UI bỏ qua paste thì
+  // thử upload file, cuối cùng mới gửi nguyên text.
+  async function attachLongPrompt(composer, fileInfo) {
+    const text = await fetchPromptText(fileInfo);
+    const before = attachmentSnapshot();
+
+    await pasteLongText(composer, text);
+    const pastedLen = composerText(composer).trim().length;
+    log("large prompt pasted:", pastedLen, "chars in composer");
+
+    let attached;
+    if (pastedLen > 500) {
+      // Paste đã chèn text: chờ Qwen chuyển thành document (có thể mất vài giây).
+      attached = await waitForAttachment(composer, before, pastedLen, 20000);
+    } else {
+      // Không thấy text: hoặc Qwen đã chuyển ngay thành attachment, hoặc paste
+      // bị bỏ qua. Chờ attachment ngắn, rồi thử upload file.
+      attached = await waitForAttachment(composer, before, 0, 2500);
+      if (!attached) {
+        attached = await uploadFileViaUI(fileInfo, text);
+        if (attached) {
+          attached = await waitForAttachment(composer, before, 0, 15000);
+        }
+      }
+    }
+
+    if (attached) {
+      // Toàn bộ prompt đã nằm trong document. Không gửi kèm text nào để Qwen
+      // không tưởng phải gọi tool read cho tên file tạm qwen_prompt_*.txt.
+      await sleep(800);
+      setComposerClean(composer, "");
+      log("large prompt attached; composer cleared");
+    } else {
+      // Không tạo được attachment: gửi trực tiếp toàn bộ prompt đã render
+      // (file text đã chứa cả tool block + nội dung gốc).
+      log("khong tao duoc attachment; gui truc tiep text dai");
+      setComposer(composer, text);
+    }
+    await sleep(400);
+  }
+
+  // Chờ send button sẵn sàng (thường là sau khi upload xong) rồi bấm.
+  // Nếu UI chưa nhận, thử lại vài lần.
+  async function sendPrompt(composer, timeoutMs = 45000) {
+    const deadline = Date.now() + timeoutMs;
+    let clicks = 0;
+    while (Date.now() < deadline) {
+      const btn = findSendButton(composer);
+      if (!btn) {
+        await sleep(400);
+        continue;
+      }
+      const hadText = !!composerText(composer).trim();
+      btn.click();
+      clicks++;
+      log("send click", clicks);
+      await sleep(1500);
+      if (!findSendButton(composer)) return true;
+      if (hadText && !composerText(composer).trim()) return true;
+      if (clicks >= 15) break;
+    }
+    pressEnter(composer);
+    return false;
+  }
+
   async function runJob(job) {
     current = job;
     const timer = setTimeout(() => {
@@ -337,7 +597,15 @@
     try {
       await tryNewChat();
       const composer = await waitComposer();
-      await submitPrompt(composer, job.prompt);
+
+      if (job.file_info) {
+        // Large prompt: paste/upload de Qwen tao document, roi gui attachment.
+        await attachLongPrompt(composer, job.file_info);
+        await sendPrompt(composer);
+      } else {
+        // Normal flow
+        await submitPrompt(composer, job.prompt);
+      }
       await job.promise;
     } catch (e) {
       settle(job, e);
@@ -362,6 +630,8 @@
             model: r.job.model,
             prompt: r.job.prompt,
             think: r.job.think,
+            file_info: r.job.file_info,
+            toolsActive: String(r.job.prompt || "").includes("# Tool Use"),
             attached: false,
             settled: false,
           };
