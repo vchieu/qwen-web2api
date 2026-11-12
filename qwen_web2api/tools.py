@@ -282,35 +282,70 @@ def messages_to_prompt(messages, tools=None, tool_choice=None) -> str:
 _FENCE_OPEN = re.compile(
     r"```(tool_call|function_call|tool_code|json)(?![A-Za-z0-9_])[ \t]*\n?")
 _FENCE_CLOSE = re.compile(r"\s*```")
+# XML-style <tool_call>...</tool_call> tag Qwen đôi khi sinh ra
+_XML_TAG_OPEN = re.compile(r"<tool_call>[ \t]*\n?", re.IGNORECASE)
+_XML_TAG_CLOSE = re.compile(r"\s*</tool_call>", re.IGNORECASE)
 _ARGUMENT_KEYS = ("arguments", "args", "input")
 _META_KEYS = {"name", "id", "type", "description", "tool", "tool_name"}
 _NOTHING = object()
 
 
 def _iter_blocks(text):
-    """Yield (start, end, data, kind); raw_decode so ``` inside strings is safe."""
+    """Yield (start, end, data, kind); raw_decode so ``` inside strings is safe.
+
+    Hỗ trợ cả hai dạng:
+      1. ```tool_call / ```function_call / ```tool_code / ```json  ... ```
+      2. <tool_call> ... </tool_call>  (XML-style Qwen thỉnh thoảng sinh ra)
+    """
     dec = json.JSONDecoder(strict=False)
-    pos = 0
-    while True:
-        m = _FENCE_OPEN.search(text, pos)
-        if not m:
-            return
-        kind = m.group(1)
-        j = m.end()
+
+    # --- Gom tất cả match điểm mở (fence + xml) rồi xử lý theo thứ tự ---
+    class _Match:
+        __slots__ = ("start", "end_open", "kind", "is_xml")
+
+        def __init__(self, start, end_open, kind, is_xml):
+            self.start = start
+            self.end_open = end_open
+            self.kind = kind
+            self.is_xml = is_xml
+
+    candidates = []
+    for m in _FENCE_OPEN.finditer(text):
+        candidates.append(_Match(m.start(), m.end(), m.group(1), False))
+    for m in _XML_TAG_OPEN.finditer(text):
+        candidates.append(_Match(m.start(), m.end(), "tool_call", True))
+    candidates.sort(key=lambda c: c.start)
+
+    consumed_up_to = 0  # ngoài loop dùng để bỏ qua overlap
+
+    for cand in candidates:
+        if cand.start < consumed_up_to:
+            continue  # nằm trong block đã xử lý trước
+        j = cand.end_open
         while j < len(text) and text[j] in " \t\r\n":
             j += 1
         try:
             data, end = dec.raw_decode(text, j)
         except ValueError:
-            close = text.find("```", m.end())
-            yield m.start(), (close + 3 if close != -1 else m.end()), _NOTHING, kind
-            pos = close if close != -1 else m.end()
+            # Không parse được JSON: tìm đến thẻ đóng để bỏ qua
+            if cand.is_xml:
+                close = _XML_TAG_CLOSE.search(text, cand.end_open)
+                close_end = close.end() if close else cand.end_open
+            else:
+                close_idx = text.find("```", cand.end_open)
+                close_end = (close_idx + 3) if close_idx != -1 else cand.end_open
+            yield cand.start, close_end, _NOTHING, cand.kind
+            consumed_up_to = close_end
             continue
-        c = _FENCE_CLOSE.match(text, end)
+
+        if cand.is_xml:
+            c = _XML_TAG_CLOSE.match(text, end)
+        else:
+            c = _FENCE_CLOSE.match(text, end)
         if c:
             end = c.end()
-        yield m.start(), end, data, kind
-        pos = end
+        yield cand.start, end, data, cand.kind
+        consumed_up_to = end
 
 
 def _normalize_name(name, allowed):
@@ -446,7 +481,8 @@ _MISS_RE = re.compile(
 def looks_like_missed_tool_call(text) -> bool:
     if not text or len(text) >= 1200:
         return False
-    if "```tool_call" in text or "```function_call" in text:
+    if ("```tool_call" in text or "```function_call" in text
+            or "<tool_call>" in text.lower()):
         return False
     return bool(_MISS_RE.search(text))
 

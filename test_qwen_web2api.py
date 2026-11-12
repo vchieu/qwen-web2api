@@ -377,6 +377,52 @@ class TestToolsParsing(_Sandbox):
         self.assertFalse(tools.looks_like_tool_call(
             '```json\n{"name": "f"}\n```'))
         self.assertFalse(tools.looks_like_tool_call("plain answer"))
+        # XML-style tag
+        self.assertTrue(tools.looks_like_tool_call(
+            '<tool_call>\n{"name": "f", "arguments": {}}\n</tool_call>'))
+
+    def test_xml_tool_call_tag_is_parsed(self):
+        """<tool_call>...</tool_call> format được nhận dạng và parse."""
+        text = ('<tool_call>\n'
+                '{"name": "read_file", "arguments": {"path": "a.py"}}\n'
+                '</tool_call>')
+        clean, calls, dropped = tools.parse_tool_calls(
+            text, {"read_file"}, {"read_file": {"path"}})
+        self.assertEqual(dropped, [])
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["function"]["name"], "read_file")
+        self.assertEqual(json.loads(calls[0]["function"]["arguments"]),
+                         {"path": "a.py"})
+        self.assertEqual(clean, "")
+
+    def test_xml_tool_call_mixed_with_fence(self):
+        """XML tag và fence block cùng tồn tại trong cùng một response."""
+        text = ('Step 1\n'
+                '<tool_call>\n'
+                '{"name": "read_file", "arguments": {"path": "a.py"}}\n'
+                '</tool_call>\n'
+                'Step 2\n'
+                '```tool_call\n'
+                '{"name": "read_file", "arguments": {"path": "b.py"}}\n'
+                '```')
+        clean, calls, dropped = tools.parse_tool_calls(
+            text, {"read_file"}, {"read_file": {"path"}})
+        self.assertEqual(dropped, [])
+        self.assertEqual(len(calls), 2)
+        paths = [json.loads(c["function"]["arguments"])["path"] for c in calls]
+        self.assertIn("a.py", paths)
+        self.assertIn("b.py", paths)
+        self.assertIn("Step 1", clean)
+        self.assertIn("Step 2", clean)
+
+    def test_xml_tool_call_undeclared_is_dropped(self):
+        text = ('<tool_call>\n'
+                '{"name": "other", "arguments": {}}\n'
+                '</tool_call>')
+        clean, calls, dropped = tools.parse_tool_calls(text, {"f"}, None)
+        self.assertEqual(calls, [])
+        self.assertEqual(dropped, ["undeclared tool 'other'"])
+        self.assertEqual(clean, text)
 
     def test_looks_like_missed_tool_call(self):
         self.assertTrue(tools.looks_like_missed_tool_call("Let me read it."))
@@ -384,6 +430,8 @@ class TestToolsParsing(_Sandbox):
         self.assertTrue(tools.looks_like_missed_tool_call("minh se doc file"))
         self.assertFalse(tools.looks_like_missed_tool_call(
             "Let me read it\n```tool_call\n{}\n```"))
+        self.assertFalse(tools.looks_like_missed_tool_call(
+            "Let me read it\n<tool_call>\n{}\n</tool_call>"))
         self.assertFalse(tools.looks_like_missed_tool_call(
             "Let me read " + "x" * 1200))
         self.assertFalse(tools.looks_like_missed_tool_call("Xong roi."))
@@ -505,6 +553,7 @@ class TestBridgeCore(_Sandbox):
         st = bridge.status()
         self.assertTrue(st["temporary_chat"])
         self.assertFalse(st["select_model"])
+        self.assertEqual(st["attachment_prompt"], "Please read the text and action")
         self.assertEqual(st["models"], 0)
         bridge._models = [{"id": "a", "name": "A"}, {"id": "b", "name": "B"}]
         self.assertEqual(bridge.status()["models"], 2)
@@ -562,6 +611,7 @@ class TestBridgeCore(_Sandbox):
         self.assertEqual(job["model"], "m")
         self.assertTrue(job["think"])
         self.assertEqual(job["file_info"], {"path": "x"})
+        self.assertEqual(job["attachment_prompt"], "Please read the text and action")
         self.assertEqual(bridge._jobs, {})
 
     def test_native_tool_call_becomes_text_fence(self):
@@ -1132,7 +1182,7 @@ class TestConfig(_Sandbox):
     def test_default_config_has_required_keys(self):
         for key in ("host", "port", "bridge_port", "bridge_worker_ttl",
                     "bridge_job_timeout", "bridge_poll_wait", "temporary_chat",
-                    "bridge_select_model", "default_model", "prompt_max_bytes",
+                    "bridge_select_model", "attachment_prompt", "default_model", "prompt_max_bytes",
                     "retry_attempts", "tool_retry_attempts", "log_requests"):
             self.assertIn(key, DEFAULT_CONFIG)
 

@@ -24,6 +24,8 @@ DEFAULT_CONFIG = {
     "temporary_chat": False,
     # Cho phep extension chon model trong UI theo job.model.
     "bridge_select_model": True,
+    # Text prompt gui kem khi prompt dai duoc paste/attach thanh document trong UI.
+    "attachment_prompt": "Please read the text and action",
 
     "retry_attempts": 3,
     "retry_delay_sec": 2,

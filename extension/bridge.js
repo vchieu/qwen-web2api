@@ -22,6 +22,7 @@
   const MODE_NAV_KEY = "qwenUIBridgeModeNav";
   const MODE_NAV_WINDOW_MS = 60000;
   const MODE_NAV_MAX = 2;
+  const ATTACHMENT_COMPANION_PROMPT = "Please read the text and action";
 
   let pageLoadedAsTemporary = /[?&]temporary-chat=true/.test(location.search)
     || /[?&]temporary-chat=true/.test(location.href);
@@ -33,6 +34,7 @@
   let lastModelRefresh = 0;
   let lastModeCheck = 0;
   let selectModelEnabled = true;
+  let attachmentPrompt = ATTACHMENT_COMPANION_PROMPT;
 
   const log = (...a) => console.log("[qwen-ui-bridge]", ...a);
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -125,6 +127,9 @@
   async function readStatus() {
     const st = await getJSON("/status");
     if (st && typeof st.select_model === "boolean") selectModelEnabled = st.select_model;
+    if (st && typeof st.attachment_prompt === "string" && st.attachment_prompt.trim()) {
+      attachmentPrompt = st.attachment_prompt.trim();
+    }
     return st || {};
   }
 
@@ -550,6 +555,10 @@
       if (isAnswer) {
         const answerText = partsText(d.content);
         if (answerText) {
+          if (answerText.includes("The current content is empty, please regenerate")
+              || answerText.includes("当前内容为空，请重新生成")) {
+            throw new Error("Qwen error: The current content is empty, please regenerate.");
+          }
           await send(job.id, { kind: "delta", phase: "content", text: answerText });
         }
       }
@@ -772,6 +781,13 @@
   async function submitPrompt(composer, prompt) {
     setComposer(composer, prompt);
     await sleep(350);
+    // Neu UI tu dong chuyen text vua paste/nhap thanh attachment card va lam rong composer:
+    if (!composerText(composer).trim()) {
+      const companion = attachmentPrompt || ATTACHMENT_COMPANION_PROMPT;
+      log("composer empty after setting prompt; inserting companion prompt:", companion);
+      setComposerClean(composer, companion);
+      await sleep(350);
+    }
     const btn = findSendButton(composer);
     if (btn) {
       btn.click();
@@ -916,7 +932,8 @@
 
   // Prompt quá dài: paste để Qwen tự tạo document txt; nếu UI bỏ qua paste thì
   // thử upload file, cuối cùng mới gửi nguyên text.
-  async function attachLongPrompt(composer, fileInfo) {
+  async function attachLongPrompt(composer, fileInfo, companionPrompt) {
+    const promptText = companionPrompt || attachmentPrompt || ATTACHMENT_COMPANION_PROMPT;
     const text = await fetchPromptText(fileInfo);
     const before = attachmentSnapshot();
 
@@ -941,11 +958,13 @@
     }
 
     if (attached) {
-      // Toàn bộ prompt đã nằm trong document. Không gửi kèm text nào để Qwen
-      // không tưởng phải gọi tool read cho tên file tạm qwen_prompt_*.txt.
+      // Toàn bộ prompt đã nằm trong document/pasted text. Gửi kèm prompt ngắn
+      // (ví dụ "Please read the text and action", không chứa tên file tạm)
+      // để Qwen không báo "The current content is empty, please regenerate."
+      // và không nhầm với file trên máy để gọi tool read.
       await sleep(800);
-      setComposerClean(composer, "");
-      log("large prompt attached; composer cleared");
+      setComposerClean(composer, promptText);
+      log("large prompt attached; set companion prompt:", promptText);
     } else {
       // Không tạo được attachment: gửi trực tiếp toàn bộ prompt đã render
       // (file text đã chứa cả tool block + nội dung gốc).
@@ -957,7 +976,8 @@
 
   // Chờ send button sẵn sàng (thường là sau khi upload xong) rồi bấm.
   // Nếu UI chưa nhận, thử lại vài lần.
-  async function sendPrompt(composer, timeoutMs = 45000) {
+  async function sendPrompt(composer, timeoutMs = 45000, fallbackPrompt = null) {
+    const companion = fallbackPrompt || attachmentPrompt || ATTACHMENT_COMPANION_PROMPT;
     const deadline = Date.now() + timeoutMs;
     let clicks = 0;
     while (Date.now() < deadline) {
@@ -965,6 +985,12 @@
       if (!btn) {
         await sleep(400);
         continue;
+      }
+      // Tránh gửi rỗng khi có attachment/pasted text khiến Qwen trả về "The current content is empty, please regenerate."
+      if (!composerText(composer).trim()) {
+        log("composer is empty before sending; inserting companion prompt:", companion);
+        setComposerClean(composer, companion);
+        await sleep(350);
       }
       const hadText = !!composerText(composer).trim();
       btn.click();
@@ -998,8 +1024,8 @@
 
       if (job.file_info) {
         // Large prompt: paste/upload de Qwen tao document, roi gui attachment.
-        await attachLongPrompt(composer, job.file_info);
-        await sendPrompt(composer);
+        await attachLongPrompt(composer, job.file_info, job.attachment_prompt);
+        await sendPrompt(composer, 45000, job.attachment_prompt);
       } else {
         // Normal flow
         await submitPrompt(composer, job.prompt);
@@ -1032,6 +1058,7 @@
             prompt: r.job.prompt,
             think: r.job.think,
             file_info: r.job.file_info,
+            attachment_prompt: r.job.attachment_prompt || attachmentPrompt || ATTACHMENT_COMPANION_PROMPT,
             raw: r.job,
             mode_retries: r.job.mode_retries || 0,
             toolsActive: String(r.job.prompt || "").includes("# Tool Use"),

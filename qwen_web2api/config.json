@@ -3,5 +3,6 @@
   "bridge_port": 8083,
   "temporary_chat": true,
   "default_model": "qwen3.7-plus",
-  "log_requests": true
+  "log_requests": true,
+  "attachment_prompt": "DO NOT reply 'The current content is empty, please regenerate'.Please read the attached document carefully and respond."
 }

@@ -45,6 +45,8 @@ Luồng chat: `do_POST` → `_handle_chat` / `_handle_responses` →
   Chấp nhận cả spelling `temporary-chat` (hyphen) trong config file.
 - `bridge_select_model`: `false` → extension không đụng model picker; request
   vẫn chạy với model UI đang chọn.
+- `attachment_prompt`: text gửi kèm khi prompt dài được paste/attach thành document
+  (mặc định `"Please read the text and action"`) để tránh Qwen báo "The current content is empty, please regenerate."
 - `default_model`, `strict_models`, `thinking`, `retry_attempts`,
   `retry_delay_sec`, `max_body_bytes`, `prompt_max_bytes`,
   `tool_retry_on_miss`, `tool_retry_attempts`, `log_requests`, `log_file`.
@@ -77,6 +79,10 @@ Luồng chat: `do_POST` → `_handle_chat` / `_handle_responses` →
    nhận `reasoning_content` / `phase=thinking|think|reasoning` nếu Qwen đổi lại
    shape. Delta lạ được gửi `warn` (phase + keys) một lần và 20 dòng SSE gần
    nhất chứa think/reason/summary in bằng `__qwenUIBridgeDebug()`.
+   Khi Qwen UI chuyển text paste thành document card, composer bị rỗng —
+   bridge điền `attachment_prompt` (mặc định `"Please read the text and action"`)
+   trước khi bấm Send để tránh lỗi "The current content is empty, please regenerate.";
+   nếu Qwen vẫn trả về câu lỗi đó, bridge ném lỗi ngay để Python retry.
 
 ## Kiểm tra UI thủ công
 

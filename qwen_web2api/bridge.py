@@ -81,6 +81,7 @@ def status():
     return {"worker": worker_alive(), "pending": _pending.qsize(), "jobs": n,
             "temporary_chat": temporary_chat_enabled(),
             "select_model": bool(CONFIG.get("bridge_select_model", True)),
+            "attachment_prompt": str(CONFIG.get("attachment_prompt", "Please read the text and action")),
             "models": n_models,
             "last_seen_ago": round(time.time() - _last_seen, 1)
             if _last_seen else None}
@@ -135,7 +136,8 @@ def generate_stream(prompt, model, think, usage_out=None, file_info=None):
             _jobs[jid] = q
         _pending.put({"job_id": jid, "model": model, "prompt": prompt,
                       "think": bool(think), "ts": time.time(),
-                      "file_info": file_info})
+                      "file_info": file_info,
+                      "attachment_prompt": str(CONFIG.get("attachment_prompt", "Please read the text and action"))})
         tracker = _Tracker()
         emitted = False
         try:
