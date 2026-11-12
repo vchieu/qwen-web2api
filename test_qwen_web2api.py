@@ -5,11 +5,11 @@ Run:
     # or
     pytest test_qwen_web2api.py -q
 
-No network, no browser, no Qwen token needed: upstream / transport / config
-are stubbed or isolated. Keep this file self-contained so it can be pasted
-into an AI chat as-is; do not split it unless it grows past ~1500 lines.
+No network, no browser, no Qwen token needed: upstream calls are stubbed or
+isolated and the bridge endpoints run on a loopback server. Keep this file
+self-contained so it can be pasted into an AI chat as-is; do not split it
+unless it grows past ~1500 lines.
 """
-import base64
 import copy
 import http.client
 import io
@@ -40,15 +40,6 @@ def _bare_handler(path="/", headers=None):
     return h
 
 
-def _sse_lines(*payloads):
-    """Bytes lines shaped like upstream SSE."""
-    out = []
-    for p in payloads:
-        out.append(("data: " + json.dumps(p) + "\n").encode())
-        out.append(b"\n")
-    return out
-
-
 def _fake_pending(events):
     """Stand-in for bridge._pending that immediately answers every job."""
 
@@ -70,35 +61,19 @@ class _Sandbox(unittest.TestCase):
 
     def setUp(self):
         self._config = copy.deepcopy(CONFIG)
-        self._qwen = {
-            "_cred_cache": qwen._cred_cache,
-            "_refresh_last_fail": qwen._refresh_last_fail,
-            "_refresh_path": qwen._refresh_path,
-            "_api_ver": qwen._api_ver,
-            "_models_cache": dict(qwen._models_cache),
-        }
         self._bridge = {
             "_last_seen": bridge._last_seen,
             "_jobs": bridge._jobs,
             "_pending": bridge._pending,
+            "_models": list(bridge._models),
         }
         CONFIG["log_requests"] = False
-        CONFIG["debug_raw"] = False
         CONFIG["retry_attempts"] = 1
         CONFIG["retry_delay_sec"] = 0
-        CONFIG["token"] = None
-        CONFIG["cookie"] = None
-        CONFIG["token_file"] = None
 
     def tearDown(self):
         CONFIG.clear()
         CONFIG.update(self._config)
-        for k, v in self._qwen.items():
-            if k == "_models_cache":
-                qwen._models_cache.clear()
-                qwen._models_cache.update(v)
-            else:
-                setattr(qwen, k, v)
         for k, v in self._bridge.items():
             if k == "_jobs":
                 bridge._jobs.clear()
@@ -476,266 +451,32 @@ class TestModels(_Sandbox):
 
 
 # ------------------------------------------------------------------ qwen ----
-class TestQwenCredentials(_Sandbox):
+class TestQwenShared(_Sandbox):
 
-    def test_jwt_exp(self):
-        payload = base64.urlsafe_b64encode(
-            json.dumps({"exp": 1700000000}).encode()).decode().rstrip("=")
-        self.assertEqual(qwen._jwt_exp(f"h.{payload}.s"), 1700000000)
-        self.assertIsNone(qwen._jwt_exp("not-a-jwt"))
-        self.assertIsNone(qwen._jwt_exp("a.b.c"))
+    def test_log_silent_when_disabled(self):
+        CONFIG["log_requests"] = False
+        err = io.StringIO()
+        with mock.patch("sys.stderr", new=err):
+            qwen.log("nope")
+        self.assertEqual(err.getvalue(), "")
 
-    def test_cookie_value(self):
-        ck = "a=1; refresh_token=xyz; b=2"
-        self.assertEqual(qwen._cookie_value(ck, "refresh_token"), "xyz")
-        self.assertEqual(qwen._cookie_value("", "refresh_token"), "")
-        self.assertEqual(qwen._cookie_value("xrefresh_token=no", "refresh_token"),
-                         "")
-
-    def test_extract_token(self):
-        self.assertEqual(qwen._extract_token({"token": "a.b.c"}), "a.b.c")
-        self.assertEqual(qwen._extract_token({"token": "nodots"}), None)
-        self.assertEqual(
-            qwen._extract_token({"data": {"result": {"accessToken": "x.y.z"}}}),
-            "x.y.z")
-        self.assertIsNone(qwen._extract_token("nope"))
-
-    def test_read_credentials_from_json_file(self):
+    def test_log_writes_stderr_and_file(self):
+        CONFIG["log_requests"] = True
         with tempfile.TemporaryDirectory() as d:
-            path = os.path.join(d, "token.json")
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump({"token": "t1", "cookie": "c1"}, f)
-            CONFIG["token_file"] = path
-            with mock.patch.dict(os.environ):
-                os.environ.pop("QWEN_TOKEN", None)
-                self.assertEqual(qwen._read_credentials(), ("t1", "c1"))
-
-    def test_read_credentials_strips_bearer_prefix(self):
-        with tempfile.TemporaryDirectory() as d:
-            path = os.path.join(d, "token.txt")
-            with open(path, "w", encoding="utf-8") as f:
-                f.write("Bearer abc.def.ghi")
-            CONFIG["token_file"] = path
-            with mock.patch.dict(os.environ):
-                os.environ.pop("QWEN_TOKEN", None)
-                tok, _cookie = qwen._read_credentials()
-            self.assertEqual(tok, "abc.def.ghi")
-
-    def test_persist_credentials_roundtrip(self):
-        with tempfile.TemporaryDirectory() as d:
-            path = os.path.join(d, "token.json")
-            CONFIG["token_file"] = path
-            qwen._persist_credentials("tok", "ck")
+            path = os.path.join(d, "qwen.log")
+            CONFIG["log_file"] = path
+            err = io.StringIO()
+            with mock.patch("sys.stderr", new=err):
+                qwen.log("hello bridge")
+            self.assertIn("hello bridge", err.getvalue())
             with open(path, encoding="utf-8") as f:
-                data = json.load(f)
-            self.assertEqual(data, {"token": "tok", "cookie": "ck"})
-            self.assertEqual(CONFIG["token"], "tok")
-            self.assertEqual(CONFIG["cookie"], "ck")
+                self.assertIn("hello bridge", f.read())
 
-
-class TestQwenTransport(_Sandbox):
-
-    def test_browser_headers(self):
-        CONFIG["extra_headers"] = {"X-Extra": "1"}
-        CONFIG["bx_v"] = "bv"
-        CONFIG["bx_ua"] = "bu"
-        CONFIG["bx_umidtoken"] = "bt"
-        h = qwen._browser_headers("tok", "a=1")
-        self.assertEqual(h["authorization"], "Bearer tok")
-        self.assertEqual(h["cookie"], "a=1; token=tok")
-        self.assertEqual(h["bx-v"], "bv")
-        self.assertEqual(h["bx-ua"], "bu")
-        self.assertEqual(h["bx-umidtoken"], "bt")
-        self.assertEqual(h["x-extra"], "1")
-        self.assertIn("referer", h)
-
-    def test_browser_headers_keep_existing_token_cookie(self):
-        h = qwen._browser_headers("tok", "token=old; b=2", chat_id="cid")
-        self.assertEqual(h["cookie"], "token=old; b=2")
-        self.assertTrue(h["referer"].endswith("/c/cid"))
-
-    def test_candidates(self):
-        CONFIG["api_version"] = 2
-        self.assertEqual(qwen._candidates("/v2", "/v1"), ["/v2"])
-        CONFIG["api_version"] = 1
-        self.assertEqual(qwen._candidates("/v2", "/v1"), ["/v1"])
-        CONFIG["api_version"] = 0
-        qwen._api_ver = 2
-        self.assertEqual(qwen._candidates("/v2", "/v1"), ["/v2"])
-        qwen._api_ver = 0
-        self.assertEqual(qwen._candidates("/v2", "/v1"), ["/v2", "/v1"])
-
-    def test_model_items(self):
-        self.assertEqual(qwen._model_items({"data": [{"id": "a"}]}),
-                         [{"id": "a"}])
-        self.assertEqual(
-            qwen._model_items({"data": {"models": [{"id": "b"}]}}),
-            [{"id": "b"}])
-        self.assertEqual(
-            qwen._model_items({"data": {"list": [{"id": "c"}]}}),
-            [{"id": "c"}])
-        self.assertEqual(qwen._model_items({"data": "nope"}), [])
-        self.assertEqual(qwen._model_items(None), [])
-
-    def test_payload_shape(self):
-        CONFIG["chat_mode"] = "normal"
-        CONFIG["auto_search"] = True
-        p = qwen._payload("hello", "m1", "cid", True, None)
-        self.assertTrue(p["stream"])
-        self.assertEqual(p["chat_id"], "cid")
-        self.assertEqual(p["model"], "m1")
-        msg = p["messages"][0]
-        self.assertEqual(msg["content"], "hello")
-        self.assertEqual(msg["models"], ["m1"])
-        self.assertTrue(msg["feature_config"]["thinking_enabled"])
-        self.assertTrue(msg["feature_config"]["auto_search"])
-        self.assertEqual(len(str(p["timestamp"])), 10)   # seconds
-
-    def test_antibot_error(self):
-        e = qwen._antibot_error(qwen._Resp(403, {"bxpunish": "1"}), "")
-        self.assertIsNotNone(e)
-        self.assertEqual(e.status, 403)
-        self.assertIn("bxpunish=1", str(e))
-        self.assertIsNone(qwen._antibot_error(
-            qwen._Resp(200, {"bxpunish": "0"}), "all good"))
-        e = qwen._antibot_error(qwen._Resp(200, {}), "please solve captcha")
-        self.assertIsNotNone(e)
-
-    def test_http_error(self):
-        e = qwen._http_error(qwen._Resp(401, {}, body=b"denied"))
-        self.assertEqual(e.status, 401)
-        self.assertIn("token rejected/expired", str(e))
-        self.assertIn("denied", str(e))
-        e = qwen._http_error(qwen._Resp(500, {}, body=b"boom"))
-        self.assertEqual(e.status, 500)
-        self.assertNotIn("token rejected", str(e))
-
-
-class TestQwenStreamParsing(_Sandbox):
-
-    def test_sse_events_skips_noise_and_stops_at_done(self):
-        lines = [b": keep-alive\n", b"\n",
-                 b'data: {"a": 1}\n', b"data: not-json\n",
-                 b'data: {"a": 2}\n', b"data: [DONE]\n",
-                 b'data: {"a": 3}\n']
-        resp = qwen._Resp(200, {}, lines=iter(lines))
-        self.assertEqual(list(qwen._sse_events(resp)), [{"a": 1}, {"a": 2}])
-
-    def test_sse_events_raw_tail_is_capped(self):
-        lines = _sse_lines(*[{"i": i} for i in range(25)])
-        tail = []
-        list(qwen._sse_events(qwen._Resp(200, {}, lines=iter(lines)), tail))
-        self.assertEqual(len(tail), 20)
-
-    def test_event_error(self):
-        self.assertEqual(qwen._event_error(
-            {"success": False, "data": {"details": "bad"}}), "bad")
-        self.assertEqual(qwen._event_error({"error": {"message": "x"}}), "x")
-        self.assertEqual(qwen._event_error({"error": "s"}), "s")
-        self.assertEqual(qwen._event_error({"code": 1, "message": "y"}), "1: y")
-        self.assertEqual(qwen._event_error(
-            {"choices": [{"delta": {"status": "failed", "message": "boom"}}]}),
-            "boom")
-        self.assertIsNone(qwen._event_error({"choices": [{"delta": {
-            "content": "hi"}}]}))
-        self.assertIsNone(qwen._event_error({"code": 0, "message": "OK"}))
-
-    def test_deltas(self):
-        obj = {"choices": [{"delta": {
-            "content": "hi", "reasoning_content": "think"}}]}
-        self.assertEqual(list(qwen._deltas(obj)),
-                         [("reasoning", "think"), ("content", "hi")])
-        obj = {"choices": [{"delta": {"content": "hm", "phase": "think"}}]}
-        self.assertEqual(list(qwen._deltas(obj)), [("reasoning", "hm")])
-        obj = {"choices": [{"delta": {"content": [
-            {"text": "a"}, {"other": 1}]}}]}
-        self.assertEqual(list(qwen._deltas(obj)), [("content", "a")])
-        self.assertEqual(list(qwen._deltas({"choices": [None]})), [])
-
-    def test_finished(self):
-        self.assertTrue(qwen._finished(
-            {"choices": [{"finish_reason": "stop"}]}))
-        self.assertTrue(qwen._finished(
-            {"choices": [{"delta": {"status": "finished"}}]}))
-        self.assertFalse(qwen._finished({"choices": [{"delta": {}}]}))
-        self.assertFalse(qwen._finished({}))
-
-    def test_stream_text_incremental_then_cumulative(self):
-        t = qwen._StreamText()
-        self.assertEqual(t.feed("content", "he"), "he")
-        self.assertEqual(t.feed("content", "hello"), "llo")
-        self.assertEqual(t.total["content"], "hello")
-        self.assertEqual(t.feed("reasoning", "r"), "r")
-        self.assertEqual(t.total["reasoning"], "r")
-
-    def test_generate_stream_relays_deltas(self):
-        resp = qwen._Resp(200, {"content-type": "text/event-stream"}, lines=iter([
-            b'data: {"choices":[{"delta":{"content":"Hel"}}]}\n',
-            b'data: {"choices":[{"delta":{"content":"Hello"}}]}\n',
-            b"data: [DONE]\n",
-        ]))
-        with mock.patch.object(qwen, "create_chat", return_value=("cid", None)), \
-                mock.patch.object(qwen, "_headers", return_value={}), \
-                mock.patch.object(qwen, "_request", return_value=resp), \
-                mock.patch.object(qwen, "delete_chat"):
-            out = list(qwen.generate_stream("hi", "m", False))
-        self.assertEqual(out, [("content", "Hel"), ("content", "lo")])
-
-    def test_generate_stream_usage_and_non_sse_json(self):
-        body = json.dumps({
-            "choices": [{"message": {"content": "hi"}}],
-            "usage": {"prompt_tokens": 2, "completion_tokens": 1},
-        }).encode()
-        resp = qwen._Resp(200, {"content-type": "application/json"}, body=body)
-        usage = {}
-        with mock.patch.object(qwen, "create_chat", return_value=("cid", None)), \
-                mock.patch.object(qwen, "_headers", return_value={}), \
-                mock.patch.object(qwen, "_request", return_value=resp), \
-                mock.patch.object(qwen, "delete_chat"):
-            out = list(qwen.generate_stream("hi", "m", False, usage))
-        self.assertEqual(out, [("content", "hi")])
-        self.assertEqual(usage, {"prompt_tokens": 2, "completion_tokens": 1})
-
-    def test_generate_stream_surfaces_event_error(self):
-        resp = qwen._Resp(200, {"content-type": "text/event-stream"}, lines=iter([
-            b'data: {"success": false, "data": {"details": "quota"}}\n',
-        ]))
-        with mock.patch.object(qwen, "create_chat", return_value=("cid", None)), \
-                mock.patch.object(qwen, "_headers", return_value={}), \
-                mock.patch.object(qwen, "_request", return_value=resp), \
-                mock.patch.object(qwen, "delete_chat"):
-            with self.assertRaises(qwen.QwenError) as ctx:
-                list(qwen.generate_stream("hi", "m", False))
-        self.assertIn("quota", str(ctx.exception))
-
-    def test_generate_stream_refreshes_once_on_401(self):
-        CONFIG["retry_attempts"] = 2
-        denied = qwen._Resp(401, {"content-type": "text/plain"}, body=b"no")
-        ok = qwen._Resp(200, {"content-type": "text/event-stream"}, lines=iter([
-            b'data: {"choices":[{"delta":{"content":"ok"}}]}\n',
-            b"data: [DONE]\n",
-        ]))
-        with mock.patch.object(qwen, "create_chat", return_value=("cid", None)), \
-                mock.patch.object(qwen, "_headers", return_value={}), \
-                mock.patch.object(qwen, "_request",
-                                  side_effect=[denied, ok]) as req, \
-                mock.patch.object(qwen, "_read_credentials",
-                                  return_value=("t", "c")), \
-                mock.patch.object(qwen, "refresh_access_token",
-                                  return_value="newtok"), \
-                mock.patch.object(qwen, "delete_chat"):
-            out = list(qwen.generate_stream("hi", "m", False))
-        self.assertEqual(out, [("content", "ok")])
-        self.assertEqual(req.call_count, 2)
-
-    def test_generate_aggregates_stream(self):
-        chunks = [("content", "a"), ("reasoning", "r"), ("content", "b")]
-        with mock.patch.object(qwen, "generate_stream",
-                               return_value=iter(chunks)):
-            out = qwen.generate("p", "m", False)
-        self.assertEqual(out["content"], "ab")
-        self.assertEqual(out["reasoning"], "r")
-        self.assertEqual(out["usage"], {})
+    def test_qwen_error_status_roundtrip(self):
+        e = qwen.QwenError("boom", status=503)
+        self.assertEqual(str(e), "boom")
+        self.assertEqual(e.status, 503)
+        self.assertIsNone(qwen.QwenError("plain").status)
 
 
 # ---------------------------------------------------------------- bridge ----
@@ -756,6 +497,44 @@ class TestBridgeCore(_Sandbox):
         self.assertEqual(st["jobs"], 0)
         bridge._last_seen = 0
         self.assertFalse(bridge.worker_alive())
+
+    def test_status_reports_bridge_features(self):
+        CONFIG["temporary_chat"] = True
+        CONFIG["bridge_select_model"] = False
+        bridge._models = []
+        st = bridge.status()
+        self.assertTrue(st["temporary_chat"])
+        self.assertFalse(st["select_model"])
+        self.assertEqual(st["models"], 0)
+        bridge._models = [{"id": "a", "name": "A"}, {"id": "b", "name": "B"}]
+        self.assertEqual(bridge.status()["models"], 2)
+        self.assertEqual(bridge.known_models()[0], {"id": "a", "name": "A"})
+
+    def test_status_accepts_hyphenated_temporary_key(self):
+        CONFIG["temporary_chat"] = False
+        CONFIG["temporary-chat"] = True
+        self.assertTrue(bridge.status()["temporary_chat"])
+        CONFIG.pop("temporary-chat", None)
+        self.assertFalse(bridge.status()["temporary_chat"])
+
+    def test_known_models_is_a_copy(self):
+        bridge._models = [{"id": "a", "name": "A"}]
+        out = bridge.known_models()
+        self.assertEqual(out, [{"id": "a", "name": "A"}])
+        out.append({"id": "b", "name": "B"})
+        out[0]["name"] = "changed"
+        self.assertEqual(bridge.known_models(), [{"id": "a", "name": "A"}])
+
+    def test_warn_event_does_not_break_stream(self):
+        pending = _fake_pending([
+            {"kind": "warn", "message": "model picker missing"},
+            {"kind": "delta", "text": "hi"},
+            {"kind": "done"},
+        ])
+        with mock.patch.object(bridge, "worker_alive", return_value=True), \
+                mock.patch.object(bridge, "_pending", pending):
+            out = list(bridge.generate_stream("hi", "m", False))
+        self.assertEqual(out, [("content", "hi")])
 
     def test_no_browser_means_503(self):
         bridge._last_seen = 0
@@ -931,7 +710,54 @@ class TestBridgeHttp(_Sandbox):
         bridge._last_seen = time.time()
         status, body = self._req("GET", "/status")
         self.assertEqual(status, 200)
-        self.assertTrue(json.loads(body)["worker"])
+        data = json.loads(body)
+        self.assertTrue(data["worker"])
+        self.assertIn("temporary_chat", data)
+        self.assertIn("select_model", data)
+        self.assertIn("models", data)
+
+    def test_poll_publishes_models(self):
+        CONFIG["bridge_poll_wait"] = 0.05
+        bridge._models = []
+        status, _body = self._req("POST", "/poll", body={"models": [
+            {"id": "qwen3.8-max", "name": "Qwen3.8-Max"},
+            {"id": ""},
+            {"id": 3},
+            "junk",
+            {"name": "no id"},
+            {"id": " qwen-live "},
+        ]})
+        self.assertEqual(status, 200)
+        self.assertEqual(bridge.known_models(), [
+            {"id": "qwen3.8-max", "name": "Qwen3.8-Max"},
+            {"id": "qwen-live", "name": "qwen-live"},
+        ])
+
+    def test_requeue_roundtrips_job(self):
+        CONFIG["bridge_poll_wait"] = 0.5
+        while True:
+            try:
+                bridge._pending.get_nowait()
+            except queue.Empty:
+                break
+        status, body = self._req("POST", "/requeue", body={
+            "job": {"job_id": "rq1", "prompt": "hi", "ts": 1}})
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body), {"ok": True})
+        status, body = self._req("POST", "/poll", body={})
+        job = json.loads(body)["job"]
+        self.assertEqual(job["job_id"], "rq1")
+        self.assertEqual(job["prompt"], "hi")
+        self.assertGreater(job["ts"], 1)
+
+    def test_requeue_rejects_invalid_job(self):
+        status, body = self._req("POST", "/requeue",
+                                 body={"job": {"prompt": "x"}})
+        self.assertEqual(status, 400)
+        self.assertIn(b"invalid job", body)
+        status, body = self._req("POST", "/requeue", body={"job": "x"})
+        self.assertEqual(status, 400)
+        self.assertIn(b"invalid job", body)
 
 
 # ---------------------------------------------------------------- server ----
@@ -1149,6 +975,30 @@ class TestServerHelpers(_Sandbox):
         self.assertIsNone(h._resolve({"model": "x@think=maybe"}))
         self.assertEqual(h.errors, [(400, "Invalid think level: maybe", None)])
 
+    def test_resolve_strict_models_uses_bridge_list(self):
+        CONFIG["strict_models"] = True
+        h = _bare_handler()
+        with mock.patch.object(bridge, "known_models",
+                               return_value=[{"id": "qwen-live",
+                                              "name": "Live"}]):
+            self.assertEqual(h._resolve({"model": "qwen-live"}),
+                             ("qwen-live", "qwen-live", False))
+            self.assertIsNone(h._resolve({"model": "nope"}))
+        self.assertEqual(h.errors,
+                         [(404, "model 'nope' not found", "model_not_found")])
+
+    def test_models_endpoint_merges_bridge_list(self):
+        h = _bare_handler(path="/v1/models")
+        h.send_json = lambda data, status=200: h.errors.append((status, data))
+        with mock.patch.object(bridge, "known_models",
+                               return_value=[{"id": "qwen-live",
+                                              "name": "Live"}]):
+            h.do_GET()
+        self.assertEqual(h.errors[0][0], 200)
+        ids = [m["id"] for m in h.errors[0][1]["data"]]
+        self.assertIn("qwen3.8-max", ids)
+        self.assertIn("qwen-live", ids)
+
     def test_read_body_content_length(self):
         h = _bare_handler(headers={"Content-Length": "5"})
         h.rfile = io.BytesIO(b"hello")
@@ -1204,14 +1054,73 @@ class TestServerHelpers(_Sandbox):
         self.assertEqual(lines[3].strip(), "data: [DONE]")
 
 
+# ------------------------------------------------------------ server turn ----
+class TestServerTurn(_Sandbox):
+
+    def test_plain_text(self):
+        h = _bare_handler()
+        result = {"content": "hello", "reasoning": "",
+                  "usage": {"prompt_tokens": 2}}
+        with mock.patch.object(bridge, "generate", return_value=result) as gen:
+            text, reasoning, calls, usage = h._run_turn(
+                "prompt", "m", False, False, None, None, None, False)
+        self.assertEqual((text, reasoning, calls, usage),
+                         ("hello", "", None, {"prompt_tokens": 2}))
+        gen.assert_called_once_with("prompt", "m", False, file_info=None)
+
+    def test_tool_call_prose_moves_to_reasoning(self):
+        h = _bare_handler()
+        content = ('Let me check.\n```tool_call\n'
+                   '{"name": "read_file", "arguments": {"path": "a.py"}}\n```')
+        result = {"content": content, "reasoning": "", "usage": {}}
+        with mock.patch.object(bridge, "generate", return_value=result):
+            text, reasoning, calls, _usage = h._run_turn(
+                "prompt", "m", False, True, {"read_file"},
+                {"read_file": {"path"}}, None, False)
+        self.assertEqual(text, "")
+        self.assertIn("Let me check.", reasoning)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["function"]["name"], "read_file")
+
+    def test_missing_required_param_raises(self):
+        h = _bare_handler()
+        content = '```tool_call\n{"name": "read_file", "arguments": {}}\n```'
+        result = {"content": content, "reasoning": "", "usage": {}}
+        with mock.patch.object(bridge, "generate", return_value=result):
+            with self.assertRaises(qwen.QwenError) as ctx:
+                h._run_turn("prompt", "m", False, True, {"read_file"},
+                            {"read_file": {"path"}},
+                            {"read_file": {"path"}}, False)
+        self.assertIn("missing", str(ctx.exception))
+
+    def test_required_tool_without_call_raises(self):
+        h = _bare_handler()
+        result = {"content": "khong goi tool", "reasoning": "", "usage": {}}
+        with mock.patch.object(bridge, "generate", return_value=result):
+            with self.assertRaises(qwen.QwenError) as ctx:
+                h._run_turn("prompt", "m", False, False, None, None, None, True)
+        self.assertIn("required tool call", str(ctx.exception))
+
+
 # ---------------------------------------------------------------- config ----
 class TestConfig(_Sandbox):
 
     def test_default_config_has_required_keys(self):
-        for key in ("host", "port", "base_url", "default_model",
-                    "prompt_max_bytes", "retry_attempts",
-                    "tool_retry_attempts", "log_requests"):
+        for key in ("host", "port", "bridge_port", "bridge_worker_ttl",
+                    "bridge_job_timeout", "bridge_poll_wait", "temporary_chat",
+                    "bridge_select_model", "default_model", "prompt_max_bytes",
+                    "retry_attempts", "tool_retry_attempts", "log_requests"):
             self.assertIn(key, DEFAULT_CONFIG)
+
+    def test_default_config_dropped_direct_keys(self):
+        for key in ("token", "token_file", "cookie", "bx_v", "bx_ua",
+                    "bx_umidtoken", "extra_headers", "user_agent", "proxy",
+                    "impersonate", "auto_refresh", "refresh_paths",
+                    "refresh_margin_sec", "chat_mode", "api_version",
+                    "delete_chats", "auto_search", "research_mode",
+                    "thinking_format", "request_timeout_sec", "debug_raw",
+                    "debug_raw_file", "base_url", "bridge_enabled"):
+            self.assertNotIn(key, DEFAULT_CONFIG)
 
     def test_load_config_merges(self):
         with tempfile.TemporaryDirectory() as d:

@@ -14,7 +14,8 @@ from socketserver import ThreadingMixIn
 from . import __version__
 from .config import CONFIG
 from .models import MODELS, resolve_model
-from .qwen import QwenError, generate, generate_stream, log, upstream_models
+from .qwen import QwenError, log
+from . import bridge
 from .tools import (build_response_format_instruction, is_required_tool_choice,
                     looks_like_missed_tool_call, messages_to_prompt,
                     missing_required_params, parse_tool_calls, strip_code_fence,
@@ -418,7 +419,7 @@ class QwenHandler(BaseHTTPRequestHandler):
         base = raw.split("@think=")[0] if isinstance(raw, str) else raw
         if (CONFIG.get("strict_models") and isinstance(base, str) and base
                 and base not in MODELS
-                and not any(m["id"] == base for m in upstream_models())):
+                and not any(m["id"] == base for m in bridge.known_models())):
             self.send_api_error(404, f"model '{raw}' not found",
                                 ERR_INVALID, "model_not_found")
             return None
@@ -455,7 +456,7 @@ class QwenHandler(BaseHTTPRequestHandler):
                 log("tool retry skipped: client disconnected")
                 break
             call_prompt = prompt + nudge if nudge else prompt
-            result = generate(call_prompt, upstream, think, file_info=file_info)
+            result = bridge.generate(call_prompt, upstream, think, file_info=file_info)
             text, reasoning, usage = (result["content"], result["reasoning"],
                                       result["usage"])
             calls = None
@@ -518,7 +519,7 @@ class QwenHandler(BaseHTTPRequestHandler):
                     data.append({"id": n, "object": "model",
                                  "created": 1700000000, "owned_by": "qwen",
                                  "description": c.get("desc", "")})
-                for m in upstream_models():
+                for m in bridge.known_models():
                     if m["id"] not in seen:
                         seen.add(m["id"])
                         data.append({"id": m["id"], "object": "model",
@@ -527,7 +528,7 @@ class QwenHandler(BaseHTTPRequestHandler):
                 self.send_json({"object": "list", "data": data})
             elif path.startswith("/v1/models/") or path.startswith("/models/"):
                 mid = path.rsplit("/", 1)[-1]
-                if mid in MODELS or any(m["id"] == mid for m in upstream_models()):
+                if mid in MODELS or any(m["id"] == mid for m in bridge.known_models()):
                     self.send_json({"id": mid, "object": "model",
                                      "created": 1700000000, "owned_by": "qwen"})
                 else:
@@ -700,7 +701,7 @@ class QwenHandler(BaseHTTPRequestHandler):
                         None, include_usage)
         full, finish, buf = "", "stop", ""
         hold = max((len(s) for s in stops), default=0)
-        gen = generate_stream(prompt, upstream, think, file_info=file_info)
+        gen = bridge.generate_stream(prompt, upstream, think, file_info=file_info)
         try:
             for kind, delta in gen:
                 if kind == "reasoning":

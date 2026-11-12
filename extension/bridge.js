@@ -1,9 +1,11 @@
 /* Qwen Web2API UI bridge.
-   Khong dung fetch tu dung request nua.
+   Khong tu fetch completions nua (payload do app tu gui).
+   - Chon temporary chat / model trong UI theo job (best-effort, warn neu loi).
    - Tu dien composer, bam send (hoac Enter).
    - Hook fetch/XHR de bat SSE tu chinh request cua app.
    - Day delta ve proxy local.
-   Giu tab chat.qwen.ai mo, dang nhap, va chon model/thinking trong UI. */
+   Giu tab chat.qwen.ai mo, dang nhap. GET /api/v2/models chi de do danh
+   sach model cho picker; temporary mode co the navigate mot lan. */
 (() => {
   if (window.__qwenUIBridge) return;
   window.__qwenUIBridge = true;
@@ -14,9 +16,19 @@
   const NEW_CHAT_EACH_JOB = true;   // thu bam New Chat truoc moi job
   const SEND_TIMEOUT_MS = 180000;
   const COMPOSER_WAIT_MS = 15000;
+  const MODEL_REFRESH_MS = 10 * 60 * 1000;
+  const MODE_CHECK_MS = 5000;
+  const MODE_NAV_KEY = "qwenUIBridgeModeNav";
+  const MODE_NAV_WINDOW_MS = 60000;
+  const MODE_NAV_MAX = 2;
 
   let active = 0;
+  let navigating = false;
   let current = null;
+  let knownModels = [];
+  let lastModelRefresh = 0;
+  let lastModeCheck = 0;
+  let selectModelEnabled = true;
 
   const log = (...a) => console.log("[qwen-ui-bridge]", ...a);
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -45,6 +57,263 @@
       send(job.id, { kind: "error", message: msg }).finally(() => job.reject(err));
     } else {
       send(job.id, { kind: "done" }).finally(() => job.resolve());
+    }
+  }
+
+  // ----------------------------------------- models / temporary-chat mode --
+  function textOf(el) {
+    if (!el) return "";
+    return String(el.getAttribute("aria-label") || el.getAttribute("title")
+      || el.innerText || el.textContent || "").trim();
+  }
+
+  function normLabel(s) {
+    return String(s || "")
+      .toLowerCase()
+      .replace(/\.0\b/g, "")
+      .replace(/[^a-z0-9]+/g, "");
+  }
+
+  function labelMatches(targets, text) {
+    const n = normLabel(text);
+    if (!n) return false;
+    return (targets || []).some((t) => {
+      const tn = normLabel(t);
+      return tn && (n === tn || n.includes(tn));
+    });
+  }
+
+  function pressEscape() {
+    const opts = { key: "Escape", code: "Escape", keyCode: 27, which: 27, bubbles: true };
+    const el = document.activeElement || document.body;
+    if (!el) return;
+    el.dispatchEvent(new KeyboardEvent("keydown", opts));
+    el.dispatchEvent(new KeyboardEvent("keyup", opts));
+  }
+
+  async function getJSON(path) {
+    const r = await fetch(BRIDGE + path);
+    if (!r.ok) throw new Error("bridge " + path + " -> " + r.status);
+    return r.json();
+  }
+
+  async function readStatus() {
+    const st = await getJSON("/status");
+    if (st && typeof st.select_model === "boolean") selectModelEnabled = st.select_model;
+    return st || {};
+  }
+
+  // Throttled: lay danh sach model tu chinh API cua trang (chi de do picker).
+  async function refreshModels(force) {
+    const now = Date.now();
+    if (!force && now - lastModelRefresh < MODEL_REFRESH_MS) return knownModels;
+    try {
+      const r = await origFetch(BASE + "/api/v2/models", {
+        headers: { accept: "application/json" },
+        credentials: "same-origin",
+      });
+      if (!r.ok) throw new Error("models -> " + r.status);
+      const data = await r.json();
+      const src = data && data.data;
+      const list = Array.isArray(src)
+        ? src
+        : (src && (src.data || src.models || src.list));
+      const out = [];
+      for (const m of Array.isArray(list) ? list : []) {
+        if (!m || typeof m.id !== "string" || !m.id.trim()) continue;
+        const id = m.id.trim();
+        const name = (typeof m.name === "string" && m.name.trim()) || id;
+        out.push({ id: id, name: name });
+      }
+      if (out.length) {
+        knownModels = out;
+        lastModelRefresh = now;
+      }
+    } catch (e) {
+      log("model refresh skipped:", (e && e.message) || e);
+    }
+    return knownModels;
+  }
+
+  function modelTargets(model) {
+    if (!model) return [];
+    const raw = String(model).split("@think=")[0].trim();
+    if (!raw) return [];
+    const targetNorm = normLabel(raw);
+    const labels = [raw];
+    for (const m of knownModels) {
+      if (!m || !m.id) continue;
+      if (m.id === raw || normLabel(m.id) === targetNorm) {
+        labels.push(m.id);
+        if (m.name) labels.push(m.name);
+      }
+    }
+    const out = [];
+    for (const l of labels) {
+      const t = String(l || "").trim();
+      if (!t) continue;
+      if (!out.includes(t)) out.push(t);
+      const n = normLabel(t);
+      if (n && !out.includes(n)) out.push(n);
+    }
+    return out;
+  }
+
+  function findModelTrigger(targets) {
+    const nodes = Array.from(document.querySelectorAll(
+      'button, [role="button"], [role="combobox"], [aria-haspopup], [class*="model" i]'
+    ));
+    const norms = (targets || []).map(normLabel).filter(Boolean);
+    let best = null, bestScore = 0;
+    for (const el of nodes) {
+      if (!visible(el)) continue;
+      const label = textOf(el);
+      if (!label) continue;
+      const low = label.toLowerCase();
+      if (/^(send|stop|gửi|dừng)/i.test(low)) continue;
+      const n = normLabel(label);
+      let score = 0;
+      if (norms.includes(n)) score += 5;
+      else if (norms.some((t) => t && n.includes(t)
+        && Math.abs(n.length - t.length) <= 3)) score += 3;
+      const hint = ((el.getAttribute("aria-label") || "") + " "
+        + (el.getAttribute("title") || "")).toLowerCase();
+      if (/model|mô hình/.test(hint)) score += 2;
+      if (/^(qwen|qwq)/.test(n)) score += 2;
+      if (el.closest("form")) score -= 2;
+      if (el.matches('button, [role="button"], [role="combobox"], [aria-haspopup]')) score += 1;
+      if (score > bestScore) { best = el; bestScore = score; }
+    }
+    return bestScore >= 3 ? best : null;
+  }
+
+  // Chon model theo job.model. Loi UI chi warn, request van chay tiep.
+  async function selectModel(job) {
+    try {
+      if (!job || !job.model || selectModelEnabled === false) return true;
+      const targets = modelTargets(job.model);
+      if (!targets.length) return true;
+      const trigger = findModelTrigger(targets);
+      if (!trigger) {
+        send(job.id, { kind: "warn",
+          message: "khong tim thay model picker de chon " + job.model });
+        return false;
+      }
+      if (labelMatches(targets, textOf(trigger))) return true;
+
+      trigger.click();
+      await sleep(600);
+      const norms = targets.map(normLabel).filter(Boolean);
+      const options = Array.from(document.querySelectorAll(
+        '[role="option"], [role="menuitem"], [role="menuitemradio"], li, button, [role="button"]'
+      )).filter((el) => visible(el)
+        && !trigger.contains(el) && !el.contains(trigger));
+      let best = null, bestScore = 0;
+      for (const el of options) {
+        const n = normLabel(textOf(el));
+        if (!n) continue;
+        let score = 0;
+        if (norms.includes(n)) score += 5;
+        else if (norms.some((t) => n.startsWith(t) || n.includes(t))) score += 4;
+        else if (norms.some((t) => t.length >= 5 && n.length >= 4 && t.includes(n))) score += 2;
+        if (el.closest("form")) score -= 1;
+        if (score > bestScore) { best = el; bestScore = score; }
+      }
+      if (!best) {
+        pressEscape();
+        send(job.id, { kind: "warn",
+          message: "khong chon duoc model " + job.model + " trong UI" });
+        return false;
+      }
+      best.click();
+      await sleep(600);
+      const ok = labelMatches(targets, textOf(trigger));
+      if (!ok) {
+        send(job.id, { kind: "warn",
+          message: "UI chua hien model " + job.model + " sau khi chon" });
+      }
+      return ok;
+    } catch (e) {
+      send(job.id, { kind: "warn",
+        message: "model select error: " + ((e && e.message) || e) });
+      return false;
+    }
+  }
+
+  function isTemporaryPage() {
+    return /[?&]temporary-chat=true/.test(location.search);
+  }
+
+  function modeUrl(want) {
+    return BASE + (want ? "/?temporary-chat=true" : "/");
+  }
+
+  // Gioi han so lan tu navigate de doi temporary mode: tranh reload lap vo han
+  // khi app tu xoa ?temporary-chat=true khoi URL.
+  function allowIdleModeNav() {
+    const now = Date.now();
+    try {
+      const prev = JSON.parse(sessionStorage.getItem(MODE_NAV_KEY) || "{}") || {};
+      const recent = prev.at && now - prev.at < MODE_NAV_WINDOW_MS;
+      const n = recent ? (prev.n || 0) : 0;
+      if (n >= MODE_NAV_MAX) return false;
+      sessionStorage.setItem(MODE_NAV_KEY, JSON.stringify({ at: now, n: n + 1 }));
+      return true;
+    } catch (e) {
+      return true;
+    }
+  }
+
+  // Doi temporary mode truoc khi gui. Tra ve false neu phai navigate lai.
+  async function ensureMode(job) {
+    try {
+      const st = await readStatus();
+      if (typeof st.temporary_chat !== "boolean") return true;
+      const want = st.temporary_chat;
+      if (want === isTemporaryPage()) return true;
+      job.mode_retries = (job.mode_retries || 0) + 1;
+      if (job.mode_retries > 2) {
+        send(job.id, { kind: "warn",
+          message: "khong doi duoc temporary_chat=" + want
+            + "; tiep tuc voi che do hien tai" });
+        return true;
+      }
+      try {
+        job.raw.mode_retries = job.mode_retries;
+        await post("/requeue", { job: job.raw });
+      } catch (e) { /* best-effort */ }
+      navigating = true;
+      location.assign(modeUrl(want));
+      return false;
+    } catch (e) {
+      log("mode check skipped:", (e && e.message) || e);
+      return true;
+    }
+  }
+
+  // Khi ranh: bao dam tab dang o dung temporary mode (khong co job de requeue).
+  async function idleModeCheck() {
+    const now = Date.now();
+    if (now - lastModeCheck < MODE_CHECK_MS) return true;
+    lastModeCheck = now;
+    try {
+      const st = await readStatus();
+      if (typeof st.temporary_chat !== "boolean") return true;
+      if (st.temporary_chat === isTemporaryPage()) {
+        try { sessionStorage.removeItem(MODE_NAV_KEY); } catch (e) { /* best-effort */ }
+        return true;
+      }
+      if (!allowIdleModeNav()) {
+        log("temporary mode khong giu duoc sau " + MODE_NAV_MAX
+          + " lan navigate; dung thu lai");
+        return true;
+      }
+      navigating = true;
+      location.assign(modeUrl(st.temporary_chat));
+      return false;
+    } catch (e) {
+      log("idle mode check skipped:", (e && e.message) || e);
+      return true;
     }
   }
 
@@ -596,6 +865,8 @@
     }, SEND_TIMEOUT_MS);
     try {
       await tryNewChat();
+      if (!(await ensureMode(job))) return;
+      await selectModel(job);
       const composer = await waitComposer();
 
       if (job.file_info) {
@@ -620,9 +891,12 @@
   async function loop() {
     log("started on", BASE, "->", BRIDGE);
     for (;;) {
+      if (navigating) { await sleep(500); continue; }
       if (active >= MAX_JOBS) { await sleep(400); continue; }
       try {
-        const r = await post("/poll", { worker: location.host });
+        await refreshModels(false);
+        if (!(await idleModeCheck())) { await sleep(500); continue; }
+        const r = await post("/poll", { worker: location.host, models: knownModels });
         if (r && r.job) {
           active++;
           const job = {
@@ -631,6 +905,8 @@
             prompt: r.job.prompt,
             think: r.job.think,
             file_info: r.job.file_info,
+            raw: r.job,
+            mode_retries: r.job.mode_retries || 0,
             toolsActive: String(r.job.prompt || "").includes("# Tool Use"),
             attached: false,
             settled: false,
@@ -652,6 +928,11 @@
     console.log("new chat:", findNewChatButton());
     const c = findComposers()[0];
     console.log("send button:", c ? findSendButton(c) : null);
+    console.log("temporary chat page:", isTemporaryPage());
+    console.log("known models:", knownModels, "select enabled:", selectModelEnabled);
+    const trigger = findModelTrigger(
+      knownModels.map((m) => m.id || "").filter(Boolean));
+    console.log("model trigger:", trigger, trigger ? textOf(trigger) : "");
   };
 
   loop();
