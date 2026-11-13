@@ -39,12 +39,12 @@ Luồng chat: `do_POST` → `_handle_chat` / `_handle_responses` →
 
 ## Config chính
 
-- `bridge_port` (8083), `bridge_worker_ttl` (20s), `bridge_job_timeout` (300s),
+- `bridge_port` (8083), `bridge_worker_ttl` (20s), `bridge_job_timeout` (600s),
   `bridge_poll_wait` (20s).
 - `temporary_chat`: `true` → mọi job chạy ở `/?temporary-chat=true`.
   Chấp nhận cả spelling `temporary-chat` (hyphen) trong config file.
-- `bridge_select_model`: `false` → extension không đụng model picker; request
-  vẫn chạy với model UI đang chọn.
+- `bridge_select_model` (default `true`): `false` → extension không đụng model
+  picker; request vẫn chạy với model UI đang chọn.
 - `attachment_prompt`: text gửi kèm khi prompt dài được paste/attach thành document
   (mặc định `"Please read the text and action"`) để tránh Qwen báo "The current content is empty, please regenerate."
 - `default_model`, `strict_models`, `thinking`, `retry_attempts`,
@@ -73,16 +73,20 @@ Luồng chat: `do_POST` → `_handle_chat` / `_handle_responses` →
    `extra.summary_title`; hỗ trợ cả mảng cumulative (Qwen thật) lẫn disjoint
    block (`status:"finished"`). `_seenTitles` đảm bảo mỗi step title in đậm
    **một lần duy nhất**. `on_reasoning_delta` stream thinking trực tiếp về
-   client qua SSE (kể cả khi `tools_active`). Send timeout được huỷ ngay khi
-   bắt được completion response, chuyển sang watchdog 3 phút idle reset theo
-   từng chunk để không bao giờ bị timeout khi Qwen suy nghĩ lâu. Ngoài ra vẫn
-   nhận `reasoning_content` / `phase=thinking|think|reasoning` nếu Qwen đổi lại
-   shape. Delta lạ được gửi `warn` (phase + keys) một lần và 20 dòng SSE gần
-   nhất chứa think/reason/summary in bằng `__qwenUIBridgeDebug()`.
+   client qua SSE (kể cả khi `tools_active`). Send timeout 90s (`SEND_TIMEOUT_MS`)
+   để điền UI và chờ completion response bắt đầu; timeout được huỷ ngay khi
+   bắt được response, chuyển sang watchdog 3 phút idle (`STREAM_IDLE_TIMEOUT_MS`)
+   reset theo từng chunk để không bao giờ bị timeout khi Qwen suy nghĩ lâu.
+   Ngoài ra vẫn nhận `reasoning_content` / `phase=thinking|think|reasoning` nếu
+   Qwen đổi lại shape. Delta lạ được gửi `warn` (phase + keys) một lần và 20
+   dòng SSE gần nhất chứa think/reason/summary in bằng `__qwenUIBridgeDebug()`.
    Khi Qwen UI chuyển text paste thành document card, composer bị rỗng —
    bridge điền `attachment_prompt` (mặc định `"Please read the text and action"`)
    trước khi bấm Send để tránh lỗi "The current content is empty, please regenerate.";
    nếu Qwen vẫn trả về câu lỗi đó, bridge ném lỗi ngay để Python retry.
+   Bridge hook cả `window.fetch` lẫn `XMLHttpRequest` để bắt SSE khi app đổi
+   transport. Trước mỗi job, bridge bấm New Chat (`NEW_CHAT_EACH_JOB = true`)
+   để tránh lẫn context giữa các request.
 
 ## Kiểm tra UI thủ công
 
