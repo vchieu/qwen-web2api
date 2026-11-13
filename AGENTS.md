@@ -127,6 +127,31 @@ Luồng chat: `do_POST` → `_handle_chat` / `_handle_responses` →
   `bridge._jobs`, `bridge._pending`, `bridge._models`, `bridge._last_seen`.
 - Sửa hành vi thì sửa test tương ứng. Không nới assertion chỉ để pass nếu
   hành vi đang sai — báo lại thay vì che bug.
+- **`test_thinking_trace.js`**: scratch file chạy bằng Node.js để debug
+  thủ công parser thinking của `extension/bridge.js` (inject `handleData`
+  vào vm sandbox, chạy payload SSE giả). **Không phải test suite**, không
+  chạy trong CI; giữ lại để tái dùng khi cần debug lại SSE shape upstream.
+  Chạy: `node test_thinking_trace.js`
+
+## Quy ước bảo trì tài liệu
+
+Khi thay đổi source, **cập nhật AGENTS.md ngay trong cùng commit/PR** nếu
+chạm vào bất kỳ điều nào dưới đây:
+
+| Thay đổi | Phần cần cập nhật |
+| --- | --- |
+| Thêm/xoá/đổi tên file chính | **Bản đồ file** |
+| Thêm/đổi config key hoặc default | **Config chính** |
+| Thêm endpoint bridge (`/poll`, `/event`…) | **Bản đồ file** (bridge.py) |
+| Đổi luồng xử lý chat (pipeline) | **Luồng chat** (dòng ngay sau Bản đồ file) |
+| Đổi hành vi extension (timeout, hook, model pick…) | **Temporary chat & chọn model** |
+| Thêm global state mới (`_xxx`) | **Điểm dễ vỡ** + **Quy ước test** (`_Sandbox`) |
+| Thêm file test hoặc script debug | **Quy ước test** |
+| Phát hiện điểm dễ vỡ mới | **Điểm dễ vỡ** |
+
+> Nếu thay đổi nhỏ (rename biến nội bộ, refactor không đổi hành vi),
+> không cần cập nhật AGENTS.md — chỉ cập nhật khi **interface hoặc hành vi
+> quan sát được từ bên ngoài** thay đổi.
 
 ## Khi thiếu ngữ cảnh thì XIN FILE, đừng đoán
 
