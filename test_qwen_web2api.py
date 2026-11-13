@@ -424,6 +424,69 @@ class TestToolsParsing(_Sandbox):
         self.assertEqual(dropped, ["undeclared tool 'other'"])
         self.assertEqual(clean, text)
 
+    def test_shorthand_tool_name_without_key_is_parsed(self):
+        """Model sinh '{"grep", "arguments": {...}}' thiếu key 'name'."""
+        text = ('```tool_call\n'
+                '{"grep", "arguments": {"pattern": "^_cookie_pool_lock", "path": "gemini_web2api.py"}}\n'
+                '```')
+        clean, calls, dropped = tools.parse_tool_calls(
+            text, {"grep"}, {"grep": {"pattern", "path"}})
+        self.assertEqual(dropped, [])
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["function"]["name"], "grep")
+        args = json.loads(calls[0]["function"]["arguments"])
+        self.assertEqual(args["pattern"], "^_cookie_pool_lock")
+        self.assertEqual(args["path"], "gemini_web2api.py")
+        self.assertEqual(clean, "")
+
+    def test_prose_with_shorthand_tool_call_splits_cleanly(self):
+        """User report: prose kèm tool_call shorthand được tách ra và giữ lại text."""
+        prose = (
+            "I have read the attached document. Based on the conversation history...\n\n"
+            "- Phase 1 is complete\n"
+            "- Phase 2 state variables are added\n\n"
+            "Let me now implement Phase 2."
+        )
+        fence = (
+            '```tool_call\n'
+            '{"grep", "arguments": {"pattern": "^_cookie_pool_lock = threading\\\\.Lock\\\\(\\\\)", '
+            '"path": "gemini_web2api.py"}}\n'
+            '```'
+        )
+        full_text = f"{prose}\n\n{fence}"
+        clean, calls, dropped = tools.parse_tool_calls(
+            full_text, {"grep"}, {"grep": {"pattern", "path"}})
+        self.assertEqual(dropped, [])
+        self.assertEqual(clean, prose)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["function"]["name"], "grep")
+        args = json.loads(calls[0]["function"]["arguments"])
+        self.assertEqual(args["path"], "gemini_web2api.py")
+        self.assertIn("_cookie_pool_lock", args["pattern"])
+
+    def test_single_key_dict_tool_call(self):
+        """Model sinh '{"grep": {"pattern": "abc", "path": "x.py"}}'."""
+        text = '```tool_call\n{"grep": {"pattern": "abc", "path": "x.py"}}\n```'
+        clean, calls, dropped = tools.parse_tool_calls(
+            text, {"grep"}, {"grep": {"pattern", "path"}})
+        self.assertEqual(dropped, [])
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["function"]["name"], "grep")
+        args = json.loads(calls[0]["function"]["arguments"])
+        self.assertEqual(args, {"pattern": "abc", "path": "x.py"})
+        self.assertEqual(clean, "")
+
+    def test_lenient_json_single_quotes_and_trailing_comma(self):
+        """Single quotes và trailing comma được sửa tự động."""
+        text = "```tool_call\n{'name': 'f', 'arguments': {'q': 'val',},}\n```"
+        clean, calls, dropped = tools.parse_tool_calls(
+            text, {"f"}, {"f": {"q"}})
+        self.assertEqual(dropped, [])
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["function"]["name"], "f")
+        self.assertEqual(json.loads(calls[0]["function"]["arguments"]), {"q": "val"})
+        self.assertEqual(clean, "")
+
     def test_looks_like_missed_tool_call(self):
         self.assertTrue(tools.looks_like_missed_tool_call("Let me read it."))
         self.assertTrue(tools.looks_like_missed_tool_call("I'll check the log"))
@@ -1118,17 +1181,17 @@ class TestServerTurn(_Sandbox):
                          ("hello", "", None, {"prompt_tokens": 2}))
         gen.assert_called_once_with("prompt", "m", False, file_info=None)
 
-    def test_tool_call_prose_moves_to_reasoning(self):
+    def test_tool_call_prose_kept_as_text(self):
         h = _bare_handler()
         content = ('Let me check.\n```tool_call\n'
                    '{"name": "read_file", "arguments": {"path": "a.py"}}\n```')
-        result = {"content": content, "reasoning": "", "usage": {}}
+        result = {"content": content, "reasoning": "upstream thinking", "usage": {}}
         with mock.patch.object(bridge, "generate", return_value=result):
             text, reasoning, calls, _usage = h._run_turn(
                 "prompt", "m", False, True, {"read_file"},
                 {"read_file": {"path"}}, None, False)
-        self.assertEqual(text, "")
-        self.assertIn("Let me check.", reasoning)
+        self.assertEqual(text, "Let me check.")
+        self.assertEqual(reasoning, "upstream thinking")
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0]["function"]["name"], "read_file")
 

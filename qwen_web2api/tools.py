@@ -4,6 +4,7 @@ Trimmed, self-contained version of the gemini-web2api tool layer:
 flatten messages -> one prompt with a pinned '# Tool Use' block, then parse
 ```tool_call fences out of the answer with JSONDecoder.raw_decode.
 """
+import ast
 import json
 import re
 import uuid
@@ -285,9 +286,65 @@ _FENCE_CLOSE = re.compile(r"\s*```")
 # XML-style <tool_call>...</tool_call> tag Qwen đôi khi sinh ra
 _XML_TAG_OPEN = re.compile(r"<tool_call>[ \t]*\n?", re.IGNORECASE)
 _XML_TAG_CLOSE = re.compile(r"\s*</tool_call>", re.IGNORECASE)
-_ARGUMENT_KEYS = ("arguments", "args", "input")
-_META_KEYS = {"name", "id", "type", "description", "tool", "tool_name"}
+_ARGUMENT_KEYS = ("arguments", "args", "input", "parameters", "params", "action_input")
+_META_KEYS = {"name", "id", "type", "description", "tool", "tool_name", "action", "function"}
 _NOTHING = object()
+
+
+def _parse_lenient_json(raw: str):
+    """Cố gắng parse JSON từ chuỗi thô bên trong fence/tag tool_call.
+
+    Sửa chữa các lỗi cú pháp phổ biến của model:
+      1. Thiếu key "name": {"grep", "arguments": ...} -> {"name": "grep", ...}
+      2. Trailing comma: {"a": 1,} -> {"a": 1}
+      3. Python-like literals (single quotes, booleans, None)
+      4. Text bao quanh JSON bên trong fence: Cắt từ '{' đầu đến '}' cuối
+    """
+    raw = (raw or "").strip()
+    if not raw:
+        return _NOTHING
+
+    try:
+        return json.loads(raw, strict=False)
+    except ValueError:
+        pass
+
+    fb = raw.find("{")
+    lb = raw.rfind("}")
+    candidate = raw[fb:lb + 1] if (fb != -1 and lb > fb) else raw
+
+    try:
+        return json.loads(candidate, strict=False)
+    except ValueError:
+        pass
+
+    # Sửa lỗi model thiếu key "name": {"grep", "arguments": ...} hoặc {"grep", ...}
+    repaired = re.sub(
+        r'^\s*\{\s*(["\']?)([a-zA-Z0-9_.-]+)\1\s*,\s*',
+        r'{"name": "\2", ',
+        candidate,
+        count=1,
+    )
+    # Xoá trailing comma: ,} hoặc ,]
+    repaired = re.sub(r',\s*([}\]])', r'\1', repaired)
+
+    try:
+        return json.loads(repaired, strict=False)
+    except ValueError:
+        pass
+
+    # Thử ast.literal_eval (hỗ trợ single quotes, Python dict literal)
+    try:
+        py_str = re.sub(r'\btrue\b', 'True', repaired)
+        py_str = re.sub(r'\bfalse\b', 'False', py_str)
+        py_str = re.sub(r'\bnull\b', 'None', py_str)
+        val = ast.literal_eval(py_str)
+        if isinstance(val, dict):
+            return val
+    except Exception:
+        pass
+
+    return _NOTHING
 
 
 def _iter_blocks(text):
@@ -326,26 +383,29 @@ def _iter_blocks(text):
             j += 1
         try:
             data, end = dec.raw_decode(text, j)
+            if cand.is_xml:
+                c = _XML_TAG_CLOSE.match(text, end)
+            else:
+                c = _FENCE_CLOSE.match(text, end)
+            if c:
+                end = c.end()
+            yield cand.start, end, data, cand.kind
+            consumed_up_to = end
         except ValueError:
-            # Không parse được JSON: tìm đến thẻ đóng để bỏ qua
+            # Không raw_decode được JSON chuẩn: tìm đến thẻ đóng và thử parse linh hoạt
             if cand.is_xml:
                 close = _XML_TAG_CLOSE.search(text, cand.end_open)
-                close_end = close.end() if close else cand.end_open
+                close_start = close.start() if close else len(text)
+                close_end = close.end() if close else len(text)
             else:
                 close_idx = text.find("```", cand.end_open)
-                close_end = (close_idx + 3) if close_idx != -1 else cand.end_open
-            yield cand.start, close_end, _NOTHING, cand.kind
-            consumed_up_to = close_end
-            continue
+                close_start = close_idx if close_idx != -1 else len(text)
+                close_end = (close_idx + 3) if close_idx != -1 else len(text)
 
-        if cand.is_xml:
-            c = _XML_TAG_CLOSE.match(text, end)
-        else:
-            c = _FENCE_CLOSE.match(text, end)
-        if c:
-            end = c.end()
-        yield cand.start, end, data, cand.kind
-        consumed_up_to = end
+            raw_block = text[cand.end_open:close_start]
+            data = _parse_lenient_json(raw_block)
+            yield cand.start, close_end, data, cand.kind
+            consumed_up_to = close_end
 
 
 def _normalize_name(name, allowed):
@@ -434,7 +494,30 @@ def parse_tool_calls(text, allowed_names=None, tool_schemas=None):
                 continue  # quoted mid-sentence: explanation, not a call
         parsed, reason = None, ""
         if isinstance(data, dict):
-            name = data.get("name")
+            name = None
+            if isinstance(data.get("function"), dict):
+                fn = data["function"]
+                name = fn.get("name")
+                data = fn
+            elif "action" in data and ("action_input" in data or "arguments" in data):
+                name = data.get("action")
+                args_val = data.get("action_input", data.get("arguments"))
+                data = {"name": name, "arguments": args_val}
+            else:
+                name = (data.get("name") or data.get("tool")
+                        or data.get("tool_name")
+                        or (data.get("function") if isinstance(data.get("function"), str) else None))
+
+            # Trường hợp dict chỉ có 1 key là tên tool: {"grep": {"pattern": ...}}
+            if not name and len(data) == 1:
+                cand = next(iter(data.keys()))
+                if cand not in _META_KEYS and cand not in _ARGUMENT_KEYS:
+                    norm = _normalize_name(cand, allowed_names)
+                    if norm or (allowed_names is None and re.match(r"^[a-zA-Z0-9_.-]+$", cand)):
+                        name = norm or cand
+                        inner = data[cand]
+                        data = inner if isinstance(inner, dict) else {"arguments": inner}
+
             resolved = _normalize_name(name, allowed_names) if name else None
             if not name:
                 reason = "no tool name"
@@ -465,9 +548,18 @@ def parse_tool_calls(text, allowed_names=None, tool_schemas=None):
 
 def looks_like_tool_call(text) -> bool:
     for _s, _e, data, kind in _iter_blocks(text or ""):
-        if isinstance(data, dict) and data.get("name"):
-            if kind != "json" or any(k in data for k in _ARGUMENT_KEYS):
-                return True
+        if isinstance(data, dict):
+            name = (data.get("name") or data.get("tool") or data.get("tool_name")
+                    or (data.get("function") if isinstance(data.get("function"), str) else None))
+            if not name and isinstance(data.get("function"), dict):
+                name = data["function"].get("name")
+            if not name and len(data) == 1:
+                cand = next(iter(data.keys()))
+                if cand not in _META_KEYS and cand not in _ARGUMENT_KEYS:
+                    name = cand
+            if name:
+                if kind != "json" or any(k in data for k in _ARGUMENT_KEYS):
+                    return True
     return False
 
 

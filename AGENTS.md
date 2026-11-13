@@ -109,8 +109,11 @@ Luồng chat: `do_POST` → `_handle_chat` / `_handle_responses` →
 - `CONFIG` là global mutable: test phải snapshot/restore (xem `_Sandbox`).
 - `log()` chỉ ghi khi `CONFIG["log_requests"]`; test tắt log.
 - Không commit cookie/token thật hay capture request.
-- Tool protocol: model trả fence ` ```tool_call `; mọi tham số nằm trong
-  object `"arguments"`, không nằm cạnh `"name"`.
+- Tool protocol: model trả fence ` ```tool_call `; parser hỗ trợ chuẩn OpenAI
+  `{"name": "...", "arguments": {...}}` và tự động sửa các lỗi cú pháp phổ biến của Qwen
+  (shorthand `{"<tool_name>", "arguments": ...}`, single-key dict `{"<tool_name>": ...}`,
+  trailing comma, single quotes). Khi response có cả prose và tool_call, prose được giữ lại
+  ở `content` để client hiển thị cho user thay vì bị xóa hay chuyển sang reasoning.
 - `extension/bridge.js` là một content script MV3 duy nhất, chạy MAIN world
   (phải override được `window.fetch`). Không thêm file/build step. Mọi lỗi UI
   mới phải `warn` (hoặc log) rồi chạy tiếp, không throw làm hỏng request.

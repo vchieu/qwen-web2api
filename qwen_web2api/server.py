@@ -489,12 +489,9 @@ class QwenHandler(BaseHTTPRequestHandler):
                 if missing:
                     raise QwenError("model emitted invalid tool call; missing: "
                                     + ", ".join(missing))
-                # Prose lẫn với tool_call: coi phần prose là suy nghĩ, không
-                # trả về content (client chỉ cần tool_calls ở lượt này).
-                if text and text.strip():
-                    prose = text.strip()
-                    reasoning = f"{reasoning.rstrip()}\n\n{prose}" if reasoning else prose
-                    text = ""
+                # Giữ lại prose (text sạch đã tách tool_call) để hiển thị cho user.
+                if text:
+                    text = text.strip()
                 return text, reasoning, calls, usage
             if required_tool:
                 nudge = "\n\nIMPORTANT: Respond with a tool_call block ONLY."
