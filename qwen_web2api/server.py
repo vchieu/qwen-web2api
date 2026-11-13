@@ -92,7 +92,9 @@ def _cleanup_old_temp_files(max_age_sec=3600):
 
 def prepare_large_prompt(messages, tools=None, tool_choice=None):
     """Nếu prompt đã render (gồm cả tool block) vượt MAX_PROMPT_CHARS,
-    ghi nguyên prompt vào file .txt tạm và trả về (file_info, short_messages).
+    tách history sang file .txt tạm và giữ tin nhắn user cuối cùng làm prompt.
+    Nếu không thể tách (chỉ có 1 message, message cuối không phải user,
+    hoặc bản thân message cuối vượt MAX_PROMPT_CHARS), ghi nguyên prompt vào file.
     Nếu không vượt, trả về (None, messages gốc).
 
     Dùng đúng prompt mà bridge sẽ gửi (messages_to_prompt) để không bỏ sót
@@ -104,6 +106,32 @@ def prepare_large_prompt(messages, tools=None, tool_choice=None):
     # Dọn file tạm cũ trước khi tạo file mới
     _cleanup_old_temp_files()
 
+    can_split = False
+    if len(messages) > 1 and isinstance(messages[-1], dict) and messages[-1].get("role") == "user":
+        last_msg = messages[-1]
+        companion_prompt = messages_to_prompt([last_msg], tools, tool_choice)
+        if len(companion_prompt) <= MAX_PROMPT_CHARS:
+            can_split = True
+
+    if can_split:
+        history = messages[:-1]
+        history_prompt = messages_to_prompt(history)
+        file_content = f"[Conversation History]\n\n{history_prompt}"
+
+        fd, path = tempfile.mkstemp(suffix=".txt", prefix="qwen_prompt_")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(file_content)
+
+        file_info = {
+            "path": path,
+            "filename": os.path.basename(path),
+            "size": len(file_content),
+            "attachment_prompt": companion_prompt,
+        }
+        return file_info, [last_msg]
+
+    # Fallback: Không thể tách (chỉ có 1 message, hoặc message cuối không phải user,
+    # hoặc bản thân message cuối vượt MAX_PROMPT_CHARS). Ghi toàn bộ vào file.
     fd, path = tempfile.mkstemp(suffix=".txt", prefix="qwen_prompt_")
     with os.fdopen(fd, "w", encoding="utf-8") as f:
         f.write(full_prompt)
@@ -618,6 +646,8 @@ class QwenHandler(BaseHTTPRequestHandler):
         rf = build_response_format_instruction(req.get("response_format"))
         if rf:
             prompt += rf
+        if file_info and file_info.get("attachment_prompt"):
+            file_info["attachment_prompt"] = prompt
         if not prompt.strip():
             return self.send_api_error(400, "empty prompt", ERR_INVALID)
         stream = bool(req.get("stream"))
@@ -824,6 +854,8 @@ class QwenHandler(BaseHTTPRequestHandler):
         rfi = build_response_format_instruction(rf)
         if rfi:
             prompt += rfi
+        if file_info and file_info.get("attachment_prompt"):
+            file_info["attachment_prompt"] = prompt
         if not prompt.strip():
             return self.send_api_error(400, "empty input", ERR_INVALID)
         tools_active = bool(tools) and tool_choice != "none"

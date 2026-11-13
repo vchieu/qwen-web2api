@@ -134,10 +134,17 @@ def generate_stream(prompt, model, think, usage_out=None, file_info=None):
         q = queue.Queue()
         with _lock:
             _jobs[jid] = q
+        if file_info and file_info.get("attachment_prompt"):
+            # Lượt cuối của user được tách riêng ra: dùng prompt (chứa tin nhắn cuối + tool/rf/nudge nếu có)
+            att_prompt = str(prompt or file_info["attachment_prompt"])
+        else:
+            # Fallback (tin nhắn đơn quá dài hoặc không phải user): dùng attachment_prompt cấu hình,
+            # không dùng prompt vì prompt fallback chứa "[Attached file: ...]" dễ khiến model gọi nhầm tool đọc file.
+            att_prompt = str(CONFIG.get("attachment_prompt", "Please read the text and action"))
         _pending.put({"job_id": jid, "model": model, "prompt": prompt,
                       "think": bool(think), "ts": time.time(),
                       "file_info": file_info,
-                      "attachment_prompt": str(CONFIG.get("attachment_prompt", "Please read the text and action"))})
+                      "attachment_prompt": att_prompt})
         tracker = _Tracker()
         emitted = False
         try:

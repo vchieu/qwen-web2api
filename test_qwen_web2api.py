@@ -677,6 +677,16 @@ class TestBridgeCore(_Sandbox):
         self.assertEqual(job["attachment_prompt"], "Please read the text and action")
         self.assertEqual(bridge._jobs, {})
 
+    def test_generate_stream_with_custom_attachment_prompt(self):
+        pending = _fake_pending([{"kind": "delta", "text": "ok"}, {"kind": "done"}])
+        with mock.patch.object(bridge, "worker_alive", return_value=True), \
+                mock.patch.object(bridge, "_pending", pending):
+            list(bridge.generate_stream(
+                "my prompt", "m", False,
+                file_info={"path": "x", "attachment_prompt": "my prompt"}))
+        job = pending.jobs[0]
+        self.assertEqual(job["attachment_prompt"], "my prompt")
+
     def test_native_tool_call_becomes_text_fence(self):
         events = [
             {"kind": "tool_call", "name": "read_file",
@@ -1014,6 +1024,78 @@ class TestServerHelpers(_Sandbox):
         finally:
             server._remove_prompt_file(file_info)
         self.assertFalse(os.path.exists(file_info["path"]))
+
+    def test_prepare_large_prompt_splits_history_and_last_user_message(self):
+        msgs = [
+            {"role": "system", "content": "be concise"},
+            {"role": "user", "content": "x" * 50},
+            {"role": "assistant", "content": "y" * 20},
+            {"role": "user", "content": "how to fix?"},
+        ]
+        with mock.patch.object(server, "MAX_PROMPT_CHARS", 50):
+            file_info, short = server.prepare_large_prompt(msgs)
+        try:
+            self.assertIsNotNone(file_info)
+            self.assertTrue(os.path.exists(file_info["path"]))
+            self.assertTrue(file_info["filename"].startswith("qwen_prompt_"))
+            with open(file_info["path"], encoding="utf-8") as f:
+                content = f.read()
+            self.assertTrue(content.startswith("[Conversation History]\n\n"))
+            self.assertIn("be concise", content)
+            self.assertIn("x" * 50, content)
+            self.assertIn("y" * 20, content)
+            self.assertNotIn("how to fix?", content)
+            self.assertEqual(len(short), 1)
+            self.assertEqual(short[0], {"role": "user", "content": "how to fix?"})
+            self.assertEqual(file_info.get("attachment_prompt"), "how to fix?")
+        finally:
+            server._remove_prompt_file(file_info)
+        self.assertFalse(os.path.exists(file_info["path"]))
+
+    def test_prepare_large_prompt_splits_with_tools(self):
+        tools = [{"type": "function", "function": {"name": "test_tool", "parameters": {}}}]
+        msgs = [
+            {"role": "user", "content": "x" * 3000},
+            {"role": "assistant", "content": "ok"},
+            {"role": "user", "content": "run tool now"},
+        ]
+        with mock.patch.object(server, "MAX_PROMPT_CHARS", 2000):
+            file_info, short = server.prepare_large_prompt(msgs, tools=tools)
+        try:
+            self.assertIsNotNone(file_info)
+            self.assertEqual(short, [{"role": "user", "content": "run tool now"}])
+            self.assertIn("# Tool Use", file_info["attachment_prompt"])
+            self.assertIn("run tool now", file_info["attachment_prompt"])
+        finally:
+            server._remove_prompt_file(file_info)
+
+    def test_prepare_large_prompt_does_not_split_when_last_msg_not_user(self):
+        msgs = [
+            {"role": "user", "content": "x" * 50},
+            {"role": "assistant", "content": "y" * 10},
+        ]
+        with mock.patch.object(server, "MAX_PROMPT_CHARS", 50):
+            file_info, short = server.prepare_large_prompt(msgs)
+        try:
+            self.assertIsNotNone(file_info)
+            self.assertIsNone(file_info.get("attachment_prompt"))
+            self.assertIn("[Attached file:", short[0]["content"])
+        finally:
+            server._remove_prompt_file(file_info)
+
+    def test_prepare_large_prompt_does_not_split_when_last_user_msg_too_large(self):
+        msgs = [
+            {"role": "user", "content": "x" * 40},
+            {"role": "user", "content": "y" * 60},
+        ]
+        with mock.patch.object(server, "MAX_PROMPT_CHARS", 50):
+            file_info, short = server.prepare_large_prompt(msgs)
+        try:
+            self.assertIsNotNone(file_info)
+            self.assertIsNone(file_info.get("attachment_prompt"))
+            self.assertIn("[Attached file:", short[0]["content"])
+        finally:
+            server._remove_prompt_file(file_info)
 
     def test_remove_prompt_file_is_idempotent(self):
         server._remove_prompt_file(None)

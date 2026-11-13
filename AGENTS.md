@@ -47,6 +47,8 @@ Luồng chat: `do_POST` → `_handle_chat` / `_handle_responses` →
   picker; request vẫn chạy với model UI đang chọn.
 - `attachment_prompt`: text gửi kèm khi prompt dài được paste/attach thành document
   (mặc định `"Please read the text and action"`) để tránh Qwen báo "The current content is empty, please regenerate."
+  Khi prompt dài có nhiều tin nhắn và lượt cuối là user (<= 130000 ký tự), lượt cuối đó (kèm tool definitions / response_format nếu có)
+  được render tự động làm attachment_prompt điền vào composer, còn attachment_prompt cấu hình đóng vai trò fallback.
 - `default_model`, `strict_models`, `thinking`, `retry_attempts`,
   `retry_delay_sec`, `max_body_bytes`, `prompt_max_bytes`,
   `tool_retry_on_miss`, `tool_retry_attempts`, `log_requests`, `log_file`.
@@ -81,7 +83,7 @@ Luồng chat: `do_POST` → `_handle_chat` / `_handle_responses` →
    Qwen đổi lại shape. Delta lạ được gửi `warn` (phase + keys) một lần và 20
    dòng SSE gần nhất chứa think/reason/summary in bằng `__qwenUIBridgeDebug()`.
    Khi Qwen UI chuyển text paste thành document card, composer bị rỗng —
-   bridge điền `attachment_prompt` (mặc định `"Please read the text and action"`)
+   bridge điền `attachment_prompt` (lượt cuối của user nếu tách được, hoặc fallback mặc định `"Please read the text and action"`)
    trước khi bấm Send để tránh lỗi "The current content is empty, please regenerate.";
    nếu Qwen vẫn trả về câu lỗi đó, bridge ném lỗi ngay để Python retry.
    Bridge hook cả `window.fetch` lẫn `XMLHttpRequest` để bắt SSE khi app đổi
@@ -179,8 +181,10 @@ chạm vào bất kỳ điều nào dưới đây:
 - Temporary-mode switch có thể `location.assign` → mất JS đang chạy; job được
   `/requeue` trước đó và `_jobs` phía Python không bị xoá, nhưng nếu tab
   không reload thì request sẽ timeout.
-- Prompt render > `MAX_PROMPT_CHARS` (130000) được ghi file tạm
-  `qwen_prompt_*.txt`; bridge chỉ serve file đó trong tempdir.
+- Prompt render > `MAX_PROMPT_CHARS` (130000): nếu có history và lượt cuối là user (<= 130000),
+  history được ghi vào file tạm `qwen_prompt_*.txt` còn lượt cuối được điền vào composer làm prompt;
+  nếu không thể tách, toàn bộ ghi file và composer dùng fallback `attachment_prompt`.
+  Bridge chỉ serve file đó trong tempdir.
 - Global state: `bridge._pending`, `bridge._jobs`, `bridge._models`,
   `bridge._last_seen`.
 - Trên Windows, handler trả lỗi trước khi đọc body có thể reset connection;

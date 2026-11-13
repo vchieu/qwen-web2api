@@ -969,7 +969,10 @@
       // Không tạo được attachment: gửi trực tiếp toàn bộ prompt đã render
       // (file text đã chứa cả tool block + nội dung gốc).
       log("khong tao duoc attachment; gui truc tiep text dai");
-      setComposer(composer, text);
+      const fullText = (promptText && promptText !== ATTACHMENT_COMPANION_PROMPT && promptText !== attachmentPrompt)
+        ? text + "\n\n" + promptText
+        : text;
+      setComposer(composer, fullText);
     }
     await sleep(400);
   }
@@ -1061,7 +1064,8 @@
             attachment_prompt: r.job.attachment_prompt || attachmentPrompt || ATTACHMENT_COMPANION_PROMPT,
             raw: r.job,
             mode_retries: r.job.mode_retries || 0,
-            toolsActive: String(r.job.prompt || "").includes("# Tool Use"),
+            toolsActive: String(r.job.prompt || "").includes("# Tool Use")
+              || String(r.job.attachment_prompt || "").includes("# Tool Use"),
             attached: false,
             settled: false,
           };
