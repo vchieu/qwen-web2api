@@ -54,6 +54,13 @@ def main():
     print("             mo https://chat.qwen.ai (da dang nhap) + bat extension")
     print(f"  Auth:      {'enabled' if CONFIG.get('api_keys') else 'disabled (loopback only)'}")
     print(f"  Default:   {CONFIG['default_model']}")
+    from .qwen import is_debug
+    debug_on = is_debug()
+    log_req = bool(CONFIG.get("log_requests"))
+    log_file = CONFIG.get("log_file") or "(stderr only)"
+    print(f"  Debug:     {'ON' if debug_on else 'off'}  |  "
+          f"log_requests={'on' if log_req else 'off'}  |  "
+          f"log_file={log_file}")
     print()
     try:
         srv.serve_forever()

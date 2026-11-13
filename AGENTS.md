@@ -24,8 +24,8 @@ Cần mở https://chat.qwen.ai (đã đăng nhập), giữ tab mở và bật e
 | File | Vai trò |
 | --- | --- |
 | `qwen_web2api/server.py` | HTTP OpenAI-compatible: `/v1/chat/completions`, `/v1/responses`, `/v1/models`, auth, CORS, SSE, `_run_turn` (tool retry/nudge) |
-| `qwen_web2api/qwen.py` | Chỉ còn `QwenError` + `log()` dùng chung; không còn transport/token |
-| `qwen_web2api/bridge.py` | Server 8083 cho extension: `/poll`, `/event`, `/status`, `/requeue`, `/file/*`; queue job, stream event, `known_models()`, `temporary_chat_enabled()` |
+| `qwen_web2api/qwen.py` | `QwenError` + logger `log()`, `debug_log()`, `is_debug()`, `get_recent_log()` dùng chung; không còn transport/token |
+| `qwen_web2api/bridge.py` | Server 8083 cho extension: `/poll`, `/event`, `/status`, `/debug`, `/requeue`, `/file/*`; queue job, stream event, `known_models()`, `temporary_chat_enabled()` |
 | `qwen_web2api/tools.py` | Flatten messages → prompt, chèn `# Tool Use`, parse fence `tool_call`, truncate theo byte |
 | `qwen_web2api/models.py` | Alias model + `@think=0/1` |
 | `qwen_web2api/config.py` | `DEFAULT_CONFIG` + `CONFIG` (global mutable), load/find config |
@@ -52,6 +52,12 @@ Luồng chat: `do_POST` → `_handle_chat` / `_handle_responses` →
 - `default_model`, `strict_models`, `thinking`, `retry_attempts`,
   `retry_delay_sec`, `max_body_bytes`, `prompt_max_bytes`,
   `tool_retry_on_miss`, `tool_retry_attempts`, `log_requests`, `log_file`.
+- `debug` (default `false`): bật/tắt log debug chi tiết cho cả Python proxy và browser extension
+  (chấp nhận cả alias `debug_log` hoặc `verbose_log` trong config file). Khi bật, `/status` trả về
+  `debug: true`, extension kích hoạt log console chi tiết và forward event `debug` về Python,
+  đồng thời Python in thông tin chẩn đoán cho từng turn, queue và lifecycle của job.
+  Khi `debug: true`, endpoint `GET /debug` (port 8083) trả về snapshot JSON an toàn gồm config, bridge state
+  và 100 dòng log gần nhất (`recent_log`) từ cả server lẫn bridge để kiểm tra real-time.
 
 ## Temporary chat & chọn model (extension)
 
@@ -89,6 +95,20 @@ Luồng chat: `do_POST` → `_handle_chat` / `_handle_responses` →
    Bridge hook cả `window.fetch` lẫn `XMLHttpRequest` để bắt SSE khi app đổi
    transport. Trước mỗi job, bridge bấm New Chat (`NEW_CHAT_EACH_JOB = true`)
    để tránh lẫn context giữa các request.
+5. Chẩn đoán & bắt lỗi UI (Diagnostics):
+   - **Temporary chat thiếu New Chat**: `tryNewChat(job)` kiểm tra nút New Chat; nếu không tìm thấy
+     hoặc bỏ qua nút `href="/"` trong temporary mode khi DOM đã có tin nhắn cũ, gửi cảnh báo nguy cơ lẫn context.
+   - **Thiếu paste `attachment_prompt`**: sau khi paste/upload file, nếu composer bị rỗng, bridge thử điền lại;
+     nếu vẫn rỗng trước khi gửi, bridge gửi cảnh báo `warn` ngay.
+   - **Có prompt nhưng thiếu file đính kèm**: trước khi bấm Send cho job prompt lớn, bridge kiểm tra card/chip
+     attachment trong DOM (`findActiveAttachmentElements`); nếu composer có text nhưng thiếu file đính kèm,
+     bridge gửi cảnh báo `warn` lập tức.
+   - **Phát hiện browser reload làm mất file**: tiến trình job được lưu theo từng bước vào `sessionStorage`
+     (`qwenUIBridgeActiveJob`). Nếu tab tự reload hoặc người dùng reload trong khi đang xử lý (nhất là sau khi
+     đã upload file), tab mới khởi động sẽ phát hiện ngay, gửi cảnh báo `tab_reloaded` qua `/event` (hỗ trợ cả
+     `beforeunload` + `navigator.sendBeacon`) để Python ghi nhận nguyên nhân request thất bại.
+   - **Job mồ côi (orphan jobs)**: Python `/poll` tự động phát hiện và drop job hết hạn TTL hoặc job có caller
+     đã ngắt kết nối (`managed=True` nhưng không còn trong `_jobs`), không chuyển job chết cho extension.
 
 ## Kiểm tra UI thủ công
 
@@ -186,6 +206,8 @@ chạm vào bất kỳ điều nào dưới đây:
   nếu không thể tách, toàn bộ ghi file và composer dùng fallback `attachment_prompt`.
   Bridge chỉ serve file đó trong tempdir.
 - Global state: `bridge._pending`, `bridge._jobs`, `bridge._models`,
-  `bridge._last_seen`.
+  `bridge._last_seen`, `qwen._recent_log`.
+- Tab reload giữa chừng (crash hoặc do app): extension ghi nhận trạng thái qua `sessionStorage`
+  để cảnh báo nguyên nhân mất file đã upload; Python drop job orphan khi client ngắt kết nối.
 - Trên Windows, handler trả lỗi trước khi đọc body có thể reset connection;
   test cho case 403 gửi body rỗng.

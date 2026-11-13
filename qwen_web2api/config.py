@@ -37,6 +37,8 @@ DEFAULT_CONFIG = {
 
     "log_requests": True,
     "log_file": None,
+    # Bat/tat log debug chi tiet (co the dat "debug": true hoac "debug_log": true trong config.json)
+    "debug": False,
 }
 
 CONFIG = dict(DEFAULT_CONFIG)

@@ -23,6 +23,7 @@
   const MODE_NAV_WINDOW_MS = 60000;
   const MODE_NAV_MAX = 2;
   const ATTACHMENT_COMPANION_PROMPT = "Please read the text and action";
+  const ACTIVE_JOB_KEY = "qwenUIBridgeActiveJob";
 
   let pageLoadedAsTemporary = /[?&]temporary-chat=true/.test(location.search)
     || /[?&]temporary-chat=true/.test(location.href);
@@ -35,8 +36,13 @@
   let lastModeCheck = 0;
   let selectModelEnabled = true;
   let attachmentPrompt = ATTACHMENT_COMPANION_PROMPT;
+  let debugEnabled = false;
+  let lastModelRefreshWarnTs = 0;  // throttle warn về Python: 1 lần/60s
 
   const log = (...a) => console.log("[qwen-ui-bridge]", ...a);
+  const debugLog = (...a) => {
+    if (debugEnabled) console.log("[qwen-ui-bridge:debug]", ...a);
+  };
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
   async function post(path, body) {
@@ -54,9 +60,77 @@
     } catch (e) { /* proxy chet */ }
   }
 
+  function saveJobState(job, stage, details) {
+    if (!job) return;
+    job._stage = stage;
+    try {
+      sessionStorage.setItem(ACTIVE_JOB_KEY, JSON.stringify({
+        id: job.id,
+        stage: stage,
+        has_file: !!job.file_info,
+        filename: job.file_info?.filename,
+        details: details || "",
+        ts: Date.now()
+      }));
+    } catch (e) {}
+  }
+
+  function clearJobState() {
+    try {
+      sessionStorage.removeItem(ACTIVE_JOB_KEY);
+    } catch (e) {}
+  }
+
+  // Kiem tra xem tab co vua bi reload giua chung khi dang xu ly job khong
+  try {
+    const lastStateRaw = sessionStorage.getItem(ACTIVE_JOB_KEY);
+    if (lastStateRaw) {
+      sessionStorage.removeItem(ACTIVE_JOB_KEY);
+      const last = JSON.parse(lastStateRaw);
+      if (last && last.id && (Date.now() - (last.ts || 0) < 300000)) {
+        const fileMsg = last.has_file
+          ? ` (pasted file ${last.filename || 'prompt'} da bi mat sau reload)`
+          : "";
+        const reloadMsg = `CANH BAO: Browser/Tab da tu reload khi dang xu ly job ${last.id} o buoc '${last.stage}'${fileMsg}`;
+        console.warn("[qwen-ui-bridge] RELOAD DETECTED:", reloadMsg);
+        post("/event", {
+          job_id: last.id,
+          kind: "warn",
+          message: reloadMsg,
+          tab_reloaded: true,
+          stage: last.stage
+        }).catch(() => {});
+      }
+    }
+  } catch (e) {}
+
+  if (typeof window.addEventListener === "function") {
+    window.addEventListener("beforeunload", () => {
+      if (current && !current.settled) {
+        const fileMsg = current.file_info
+          ? ` (pasted file ${current.file_info.filename || 'prompt'} se bi mat!)`
+          : "";
+        const msg = `Tab dang reload/unload khi job ${current.id} chua hoan thanh (buoc: ${current._stage || 'processing'})${fileMsg}`;
+        console.warn("[qwen-ui-bridge]", msg);
+        try {
+          const payload = JSON.stringify({
+            job_id: current.id,
+            kind: "warn",
+            message: msg,
+            tab_reloading: true
+          });
+          if (typeof navigator !== "undefined" && typeof navigator.sendBeacon === "function") {
+            navigator.sendBeacon(BRIDGE + "/event", new Blob([payload], { type: "application/json" }));
+          }
+        } catch (e) {}
+      }
+    });
+  }
+
   function settle(job, err) {
     if (!job || job.settled) return;
     job.settled = true;
+    clearJobState();
     if (err) {
       const msg = String((err && err.message) || err);
       log("job error:", msg);
@@ -130,6 +204,9 @@
     if (st && typeof st.attachment_prompt === "string" && st.attachment_prompt.trim()) {
       attachmentPrompt = st.attachment_prompt.trim();
     }
+    if (st && typeof st.debug === "boolean") {
+      debugEnabled = st.debug;
+    }
     return st || {};
   }
 
@@ -161,6 +238,13 @@
       }
     } catch (e) {
       log("model refresh skipped:", (e && e.message) || e);
+      // Forward warn về Python nếu có job đang chạy, rate-limited 60s
+      const now = Date.now();
+      if (now - lastModelRefreshWarnTs > 60000) {
+        lastModelRefreshWarnTs = now;
+        const msg = "model refresh fail: " + ((e && e.message) || String(e));
+        post("/event", { job_id: "none", kind: "warn", message: msg }).catch(() => {});
+      }
     }
     return knownModels;
   }
@@ -229,7 +313,12 @@
           message: "khong tim thay model picker de chon " + job.model });
         return false;
       }
-      if (labelMatches(targets, textOf(trigger))) return true;
+      const currentModelLabel = textOf(trigger);
+      if (labelMatches(targets, currentModelLabel)) {
+        debugLog("selectModel: already on correct model:", currentModelLabel);
+        return true;
+      }
+      debugLog("selectModel: switching from '" + currentModelLabel + "' to '" + job.model + "'");
 
       trigger.click();
       await sleep(600);
@@ -252,7 +341,7 @@
       if (!best) {
         pressEscape();
         send(job.id, { kind: "warn",
-          message: "khong chon duoc model " + job.model + " trong UI" });
+          message: "khong chon duoc model " + job.model + " trong UI (hien tai: '" + currentModelLabel + "')" });
         return false;
       }
       best.click();
@@ -260,7 +349,7 @@
       const ok = labelMatches(targets, textOf(trigger));
       if (!ok) {
         send(job.id, { kind: "warn",
-          message: "UI chua hien model " + job.model + " sau khi chon" });
+          message: "UI chua hien model " + job.model + " sau khi chon (hien tai: '" + textOf(trigger) + "')" });
       }
       return ok;
     } catch (e) {
@@ -720,6 +809,13 @@
     el.dispatchEvent(new Event("change", { bubbles: true }));
   }
 
+  function hasChatMessages() {
+    const nodes = document.querySelectorAll(
+      '[class*="message" i], [class*="bubble" i], [data-message-id], [class*="chat-item" i]'
+    );
+    return Array.from(nodes).some((el) => visible(el) && (el.innerText || el.textContent || "").trim().length > 10);
+  }
+
   function findNewChatButton() {
     const rx = /new\s*chat|new\s*conversation|chat\s*mới|cuộc\s*trò\s*chuyện\s*mới|tạo\s*cuộc|new\s*chat/i;
     const nodes = Array.from(document.querySelectorAll('button, a, [role="button"]'));
@@ -735,19 +831,41 @@
     return bestScore >= 2 ? best : null;
   }
 
-  async function tryNewChat() {
+  async function tryNewChat(job) {
     if (!NEW_CHAT_EACH_JOB) return;
     const st = await readStatus();
     const wantTemp = st && st.temporary_chat;
     const btn = findNewChatButton();
     if (!btn) {
-      log("khong tim thay nut New Chat; se gui trong chat hien tai");
+      const hasMsg = hasChatMessages();
+      const warnMsg = "khong tim thay nut New Chat" +
+        (wantTemp ? " trong temporary chat mode" : "") +
+        (hasMsg ? " (CANH BAO: cuoc tro chuyen hien tai DA CO tin nhan, context co the bi lan!)" : " (trang hien tai dang rong)");
+      log(warnMsg);
+      if (job) send(job.id, { kind: hasMsg ? "warn" : "debug", message: warnMsg });
       return;
     }
     if (wantTemp && btn.tagName === "A" && btn.getAttribute("href") === "/") {
-      log("dang o temporary chat mode; khong click link href=/ de tranh thoat temporary");
+      // Thu tim nut New Chat khac (khong phai the <a> co href=/)
+      const otherBtn = Array.from(document.querySelectorAll('button, [role="button"]')).find((el) => {
+        if (!visible(el) || el === btn || el.contains(btn) || btn.contains(el)) return false;
+        const label = (el.getAttribute("aria-label") || el.getAttribute("title") || el.textContent || "").trim();
+        return /new\s*chat|new\s*conversation|chat\s*mới|tạo\s*cuộc/i.test(label);
+      });
+      if (otherBtn) {
+        debugLog("tim thay nut New Chat thay the trong temporary chat:", textOf(otherBtn));
+        otherBtn.click();
+        await sleep(1200);
+        return;
+      }
+      const hasMsg = hasChatMessages();
+      const warnMsg = "dang o temporary chat mode; bo qua nut New Chat co href=/ de tranh thoat temporary" +
+        (hasMsg ? " (CANH BAO: cuoc tro chuyen hien tai DA CO tin nhan, context co the bi lan!)" : " (phien hien tai chua co tin nhan)");
+      log(warnMsg);
+      if (job) send(job.id, { kind: hasMsg ? "warn" : "debug", message: warnMsg });
       return;
     }
+    debugLog("clicking New Chat button:", textOf(btn));
     btn.click();
     await sleep(1200);
   }
@@ -778,7 +896,8 @@
     el.dispatchEvent(new KeyboardEvent("keyup", opts));
   }
 
-  async function submitPrompt(composer, prompt) {
+  async function submitPrompt(composer, prompt, job) {
+    saveJobState(job, "typing_prompt", "Setting prompt text");
     setComposer(composer, prompt);
     await sleep(350);
     // Neu UI tu dong chuyen text vua paste/nhap thanh attachment card va lam rong composer:
@@ -787,7 +906,13 @@
       log("composer empty after setting prompt; inserting companion prompt:", companion);
       setComposerClean(composer, companion);
       await sleep(350);
+      if (!composerText(composer).trim()) {
+        const warnMsg = "CANH BAO: Composer bi rong khi submit prompt nhung thieu paste companion prompt!";
+        log(warnMsg);
+        if (job) send(job.id, { kind: "warn", message: warnMsg });
+      }
     }
+    saveJobState(job, "submitting", "Clicking send button");
     const btn = findSendButton(composer);
     if (btn) {
       btn.click();
@@ -812,6 +937,23 @@
       + '[data-testid*="file" i], [data-testid*="attach" i], '
       + '[data-testid*="document" i]';
     return new Set(Array.from(document.querySelectorAll(sel)).filter(visible));
+  }
+
+  // Tìm các element attachment (file, document card, chip) đang hiện hữu
+  function findActiveAttachmentElements(composer) {
+    const scope = composer?.closest("form") || composer?.parentElement?.parentElement || document;
+    const sel = '[class*="file" i], [class*="attach" i], [class*="upload" i], '
+      + '[class*="document" i], [class*="doc" i], [class*="chip" i], '
+      + '[data-testid*="file" i], [data-testid*="attach" i], '
+      + '[data-testid*="document" i]';
+    return Array.from(scope.querySelectorAll(sel)).filter((el) => {
+      if (!visible(el)) return false;
+      const isBtn = el.tagName === "BUTTON" || el.getAttribute("role") === "button";
+      const txt = (el.getAttribute("aria-label") || el.getAttribute("title") || el.textContent || "").toLowerCase().trim();
+      // Loại trừ nút bấm đính kèm (button upload file)
+      if (isBtn && /^(attach|đính kèm|dính kèm|upload)/i.test(txt)) return false;
+      return true;
+    });
   }
 
   // Chờ Qwen tạo attachment từ text vừa paste. Ngoài việc xuất hiện node mới,
@@ -893,7 +1035,7 @@
   }
 
   // Fallback: đẩy file qua input[type=file] của Qwen UI.
-  async function uploadFileViaUI(fileInfo, text) {
+  async function uploadFileViaUI(fileInfo, text, job) {
     log("uploading large prompt file:", fileInfo.filename);
     const file = new File([text], fileInfo.filename, { type: "text/plain" });
 
@@ -911,6 +1053,9 @@
     }
     if (!fileInput) {
       log("khong tim thay input[type=file] cua Qwen UI");
+      if (typeof job !== "undefined" && job) {
+        send(job.id, { kind: "warn", message: "CANH BAO: uploadFileViaUI that bai - khong tim thay input[type=file] trong DOM. UI co the da doi layout." });
+      }
       return false;
     }
 
@@ -932,11 +1077,12 @@
 
   // Prompt quá dài: paste để Qwen tự tạo document txt; nếu UI bỏ qua paste thì
   // thử upload file, cuối cùng mới gửi nguyên text.
-  async function attachLongPrompt(composer, fileInfo, companionPrompt) {
+  async function attachLongPrompt(composer, fileInfo, companionPrompt, job) {
     const promptText = companionPrompt || attachmentPrompt || ATTACHMENT_COMPANION_PROMPT;
     const text = await fetchPromptText(fileInfo);
     const before = attachmentSnapshot();
 
+    saveJobState(job, "pasting_file", "Pasting file: " + fileInfo.filename);
     await pasteLongText(composer, text);
     const pastedLen = composerText(composer).trim().length;
     log("large prompt pasted:", pastedLen, "chars in composer");
@@ -950,25 +1096,53 @@
       // bị bỏ qua. Chờ attachment ngắn, rồi thử upload file.
       attached = await waitForAttachment(composer, before, 0, 2500);
       if (!attached) {
-        attached = await uploadFileViaUI(fileInfo, text);
+        saveJobState(job, "uploading_file", "Uploading file via UI fallback: " + fileInfo.filename);
+        attached = await uploadFileViaUI(fileInfo, text, job);
         if (attached) {
           attached = await waitForAttachment(composer, before, 0, 15000);
         }
-      }
-    }
+      }    }
 
     if (attached) {
-      // Toàn bộ prompt đã nằm trong document/pasted text. Gửi kèm prompt ngắn
-      // (ví dụ "Please read the text and action", không chứa tên file tạm)
-      // để Qwen không báo "The current content is empty, please regenerate."
-      // và không nhầm với file trên máy để gọi tool read.
+      saveJobState(job, "file_uploaded", "File attached in DOM: " + fileInfo.filename);
+      // Kiem tra xac thuc thuc su co card/chip attachment trong DOM
+      const activeAtts = findActiveAttachmentElements(composer);
+      if (!activeAtts.length) {
+        const warnMsg = "CANH BAO: Co attachment_prompt nhung thieu pasted file trong DOM (khong tim thay card/chip file sau khi paste/upload)!";
+        log(warnMsg);
+        if (job) send(job.id, { kind: "warn", message: warnMsg });
+      } else {
+        debugLog("Pasted file confirmed attached in DOM (" + activeAtts.length + " element(s))");
+        if (job) send(job.id, { kind: "debug", message: "Pasted file confirmed attached in DOM (" + activeAtts.length + " items)" });
+      }
+
       await sleep(800);
       setComposerClean(composer, promptText);
+      await sleep(300);
+
+      // Kiem tra xem attachment_prompt da thuc su duoc paste vao composer chua
+      let currentText = composerText(composer).trim();
+      if (!currentText) {
+        log("attachment_prompt chua xuat hien trong composer, thu set lai lan 2...");
+        setComposerClean(composer, promptText);
+        await sleep(350);
+        currentText = composerText(composer).trim();
+      }
+      if (!currentText) {
+        const warnMsg = "CANH BAO: Thieu paste attachment_prompt vao composer! Composer van dang rong sau khi attach file.";
+        log(warnMsg);
+        if (job) send(job.id, { kind: "warn", message: warnMsg });
+      } else {
+        saveJobState(job, "prompt_inserted", "Attachment prompt inserted: " + currentText.slice(0, 30));
+        debugLog("attachment_prompt pasted successfully (" + currentText.length + " chars):", currentText.slice(0, 60));
+        if (job) send(job.id, { kind: "debug", message: "Attachment prompt pasted: " + currentText.slice(0, 60) });
+      }
       log("large prompt attached; set companion prompt:", promptText);
     } else {
       // Không tạo được attachment: gửi trực tiếp toàn bộ prompt đã render
-      // (file text đã chứa cả tool block + nội dung gốc).
+      saveJobState(job, "fallback_raw_text", "Could not attach file, sending raw text");
       log("khong tao duoc attachment; gui truc tiep text dai");
+      if (job) send(job.id, { kind: "warn", message: "Khong tao duoc attachment card; gui truc tiep text dai" });
       const fullText = (promptText && promptText !== ATTACHMENT_COMPANION_PROMPT && promptText !== attachmentPrompt)
         ? text + "\n\n" + promptText
         : text;
@@ -979,7 +1153,7 @@
 
   // Chờ send button sẵn sàng (thường là sau khi upload xong) rồi bấm.
   // Nếu UI chưa nhận, thử lại vài lần.
-  async function sendPrompt(composer, timeoutMs = 45000, fallbackPrompt = null) {
+  async function sendPrompt(composer, timeoutMs = 45000, fallbackPrompt = null, job = null) {
     const companion = fallbackPrompt || attachmentPrompt || ATTACHMENT_COMPANION_PROMPT;
     const deadline = Date.now() + timeoutMs;
     let clicks = 0;
@@ -989,12 +1163,31 @@
         await sleep(400);
         continue;
       }
-      // Tránh gửi rỗng khi có attachment/pasted text khiến Qwen trả về "The current content is empty, please regenerate."
+
+      // Kiem tra thieu paste attachment_prompt
       if (!composerText(composer).trim()) {
         log("composer is empty before sending; inserting companion prompt:", companion);
         setComposerClean(composer, companion);
         await sleep(350);
+        if (!composerText(composer).trim()) {
+          const warnMsg = "CANH BAO: Chuan bi gui nhung thieu paste attachment_prompt vao composer (composer van dang rong)!";
+          log(warnMsg);
+          if (job) send(job.id, { kind: "warn", message: warnMsg });
+        }
       }
+
+      // Kiem tra co attachment_prompt nhung thieu pasted file
+      if (job && job.file_info) {
+        const hasAtt = findActiveAttachmentElements(composer).length > 0;
+        const hasTxt = !!composerText(composer).trim();
+        if (hasTxt && !hasAtt) {
+          const warnMsg = "CANH BAO NGUY HIEM: Composer co attachment_prompt ('" + composerText(composer).trim().slice(0, 40) + "...') nhung KHONG co pasted file / attachment card nao trong DOM truoc khi bam gui!";
+          log(warnMsg);
+          send(job.id, { kind: "warn", message: warnMsg });
+        }
+      }
+
+      saveJobState(job, "sending", "Clicking send button (click #" + (clicks + 1) + ")");
       const hadText = !!composerText(composer).trim();
       btn.click();
       clicks++;
@@ -1010,6 +1203,7 @@
 
   async function runJob(job) {
     current = job;
+    saveJobState(job, "started", "Job " + job.id + " started");
     let sendTimer = setTimeout(() => {
       settle(job, new Error("UI send timeout: khong bat duoc completion response"));
     }, SEND_TIMEOUT_MS);
@@ -1020,24 +1214,28 @@
       }
     };
     try {
-      await tryNewChat();
+      await tryNewChat(job);
+      saveJobState(job, "new_chat_done", "New chat step finished");
       if (!(await ensureMode(job))) return;
       await selectModel(job);
+      saveJobState(job, "model_selected", "Model " + job.model);
       const composer = await waitComposer();
+      saveJobState(job, "composer_ready", "Composer found");
 
       if (job.file_info) {
         // Large prompt: paste/upload de Qwen tao document, roi gui attachment.
-        await attachLongPrompt(composer, job.file_info, job.attachment_prompt);
-        await sendPrompt(composer, 45000, job.attachment_prompt);
+        await attachLongPrompt(composer, job.file_info, job.attachment_prompt, job);
+        await sendPrompt(composer, 45000, job.attachment_prompt, job);
       } else {
         // Normal flow
-        await submitPrompt(composer, job.prompt);
+        await submitPrompt(composer, job.prompt, job);
       }
       await job.promise;
     } catch (e) {
       settle(job, e);
     } finally {
       if (typeof job._clearSendTimer === "function") job._clearSendTimer();
+      clearJobState();
       current = null;
     }
   }
@@ -1076,6 +1274,9 @@
           runJob(job).finally(() => { active--; });
         }
       } catch (e) {
+        const msg = (e && e.message) || String(e);
+        console.warn("[qwen-ui-bridge] poll loop error:", msg);
+        debugLog("poll loop error:", msg);
         await sleep(2000);
       }
     }
@@ -1086,7 +1287,11 @@
     console.log("new chat:", findNewChatButton());
     const c = findComposers()[0];
     console.log("send button:", c ? findSendButton(c) : null);
+    console.log("active attachments:", findActiveAttachmentElements(c));
+    console.log("has chat messages:", hasChatMessages());
     console.log("temporary chat page:", isTemporaryPage());
+    console.log("debug enabled:", debugEnabled);
+    console.log("active job in sessionStorage:", sessionStorage.getItem(ACTIVE_JOB_KEY));
     console.log("known models:", knownModels, "select enabled:", selectModelEnabled);
     const trigger = findModelTrigger(
       knownModels.map((m) => m.id || "").filter(Boolean));

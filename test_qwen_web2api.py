@@ -67,6 +67,7 @@ class _Sandbox(unittest.TestCase):
             "_pending": bridge._pending,
             "_models": list(bridge._models),
         }
+        self._recent_log_snapshot = list(qwen._recent_log)
         CONFIG["log_requests"] = False
         CONFIG["retry_attempts"] = 1
         CONFIG["retry_delay_sec"] = 0
@@ -74,6 +75,9 @@ class _Sandbox(unittest.TestCase):
     def tearDown(self):
         CONFIG.clear()
         CONFIG.update(self._config)
+        with qwen._log_lock:
+            qwen._recent_log.clear()
+            qwen._recent_log.extend(self._recent_log_snapshot)
         for k, v in self._bridge.items():
             if k == "_jobs":
                 bridge._jobs.clear()
@@ -589,6 +593,32 @@ class TestQwenShared(_Sandbox):
         self.assertEqual(e.status, 503)
         self.assertIsNone(qwen.QwenError("plain").status)
 
+    def test_debug_log_disabled_by_default(self):
+        CONFIG["log_requests"] = True
+        CONFIG["debug"] = False
+        err = io.StringIO()
+        with mock.patch("sys.stderr", new=err):
+            qwen.debug_log("hidden debug")
+        self.assertEqual(err.getvalue(), "")
+
+    def test_debug_log_writes_when_enabled(self):
+        CONFIG["log_requests"] = True
+        CONFIG["debug"] = True
+        err = io.StringIO()
+        with mock.patch("sys.stderr", new=err):
+            qwen.debug_log("visible debug")
+        self.assertIn("[debug] visible debug", err.getvalue())
+
+    def test_is_debug_accepts_aliases(self):
+        CONFIG["debug"] = False
+        CONFIG["debug_log"] = False
+        self.assertFalse(qwen.is_debug())
+        CONFIG["debug"] = True
+        self.assertTrue(qwen.is_debug())
+        CONFIG["debug"] = False
+        CONFIG["debug_log"] = True
+        self.assertTrue(qwen.is_debug())
+
 
 # ---------------------------------------------------------------- bridge ----
 class TestBridgeCore(_Sandbox):
@@ -612,10 +642,12 @@ class TestBridgeCore(_Sandbox):
     def test_status_reports_bridge_features(self):
         CONFIG["temporary_chat"] = True
         CONFIG["bridge_select_model"] = False
+        CONFIG["debug"] = True
         bridge._models = []
         st = bridge.status()
         self.assertTrue(st["temporary_chat"])
         self.assertFalse(st["select_model"])
+        self.assertTrue(st["debug"])
         self.assertEqual(st["attachment_prompt"], "Please read the text and action")
         self.assertEqual(st["models"], 0)
         bridge._models = [{"id": "a", "name": "A"}, {"id": "b", "name": "B"}]
@@ -816,6 +848,44 @@ class TestBridgeHttp(_Sandbox):
         status, body = self._req("POST", "/poll", body={})
         self.assertEqual(status, 200)
         self.assertEqual(json.loads(body)["job"]["job_id"], "j1")
+
+    def test_poll_drops_orphan_managed_job(self):
+        CONFIG["bridge_poll_wait"] = 0.05
+        # Job co managed=True nhung khong co trong bridge._jobs -> phai bi drop
+        bridge._pending.put({"job_id": "orphan_1", "ts": time.time(), "managed": True})
+        status, body = self._req("POST", "/poll", body={})
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body), {"job": None})
+
+    def test_poll_drops_expired_job(self):
+        CONFIG["bridge_poll_wait"] = 0.05
+        CONFIG["bridge_job_timeout"] = 10
+        # Job co ts qua cu (het han ttl) -> phai bi drop
+        bridge._pending.put({"job_id": "exp_1", "ts": time.time() - 100})
+        status, body = self._req("POST", "/poll", body={})
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body), {"job": None})
+
+    def test_event_handles_tab_reloaded_warning(self):
+        # Gui event canh bao tab reload ma khong co active job van thanh cong va duoc ghi log
+        status, body = self._req("POST", "/event", body={
+            "job_id": "job_reloaded",
+            "kind": "warn",
+            "tab_reloaded": True,
+            "stage": "file_uploaded",
+            "message": "Browser/Tab da tu reload khi dang xu ly job"
+        })
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body), {"ok": True})
+
+    def test_event_handles_none_job_id_warning(self):
+        status, body = self._req("POST", "/event", body={
+            "job_id": "none",
+            "kind": "warn",
+            "message": "model refresh fail: connection error"
+        })
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body), {"ok": True})
 
     def test_event_routes_to_job_queue(self):
         q = queue.Queue()
@@ -1328,7 +1398,7 @@ class TestConfig(_Sandbox):
         for key in ("host", "port", "bridge_port", "bridge_worker_ttl",
                     "bridge_job_timeout", "bridge_poll_wait", "temporary_chat",
                     "bridge_select_model", "attachment_prompt", "default_model", "prompt_max_bytes",
-                    "retry_attempts", "tool_retry_attempts", "log_requests"):
+                    "retry_attempts", "tool_retry_attempts", "log_requests", "debug"):
             self.assertIn(key, DEFAULT_CONFIG)
 
     def test_default_config_dropped_direct_keys(self):
@@ -1360,6 +1430,186 @@ class TestConfig(_Sandbox):
     def test_find_config_returns_none_when_absent(self):
         with mock.patch("os.path.exists", return_value=False):
             self.assertIsNone(find_config())
+
+
+# ------------------------------------------------------ bridge debug log ----
+class TestBridgeDebugLog(_Sandbox):
+    """Tests for the new debug logging improvements."""
+
+    def test_recent_log_buffer_is_populated(self):
+        """_log() phải ghi vào _recent_log deque."""
+        from collections import deque
+        self.assertIsInstance(bridge._recent_log, deque)
+        import collections as _col
+        old = list(bridge._recent_log)
+        CONFIG["log_requests"] = True
+        bridge._log("test message for deque")
+        new = list(bridge._recent_log)
+        # Phải có ít nhất 1 entry mới hơn
+        self.assertGreater(len(new), len(old))
+        self.assertTrue(any("test message for deque" in s for s in new))
+
+    def test_server_logs_appear_in_recent_log(self):
+        """Log từ server.py và qwen.py phải được lưu vào recent_log."""
+        CONFIG["log_requests"] = True
+        CONFIG["debug"] = True
+        qwen.log("server test log event")
+        qwen.debug_log("server test debug event")
+        logs = qwen.get_recent_log()
+        self.assertTrue(any("server test log event" in s for s in logs))
+        self.assertTrue(any("server test debug event" in s for s in logs))
+
+    def test_debug_endpoint_forbidden_when_debug_off(self):
+        """GET /debug trả 403 khi debug=false."""
+        CONFIG["debug"] = False
+        srv = bridge._Server(("127.0.0.1", 0), bridge._Handler)
+        port = srv.server_address[1]
+        t = threading.Thread(target=srv.serve_forever, daemon=True)
+        t.start()
+        try:
+            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+            conn.request("GET", "/debug")
+            r = conn.getresponse()
+            self.assertEqual(r.status, 403)
+            body = json.loads(r.read())
+            self.assertIn("debug mode", body.get("error", ""))
+        finally:
+            srv.shutdown()
+            srv.server_close()
+            t.join(2)
+
+    def test_debug_endpoint_returns_state_when_enabled(self):
+        """GET /debug trả config + bridge state khi debug=true."""
+        CONFIG["debug"] = True
+        CONFIG["log_requests"] = True
+        bridge._last_seen = time.time()
+        srv = bridge._Server(("127.0.0.1", 0), bridge._Handler)
+        port = srv.server_address[1]
+        t = threading.Thread(target=srv.serve_forever, daemon=True)
+        t.start()
+        try:
+            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+            conn.request("GET", "/debug")
+            r = conn.getresponse()
+            self.assertEqual(r.status, 200)
+            data = json.loads(r.read())
+            self.assertIn("config", data)
+            self.assertIn("bridge", data)
+            self.assertIn("recent_log", data)
+            self.assertIn("debug", data["config"])
+            self.assertTrue(data["config"]["debug"])
+            self.assertIn("worker_alive", data["bridge"])
+            self.assertIn("active_jobs", data["bridge"])
+            self.assertIn("known_models_count", data["bridge"])
+        finally:
+            srv.shutdown()
+            srv.server_close()
+            t.join(2)
+
+    def test_debug_endpoint_safe_keys_only(self):
+        """GET /debug không expose api_keys hay cookie."""
+        CONFIG["debug"] = True
+        CONFIG["log_requests"] = True
+        CONFIG["api_keys"] = ["secret_key_123"]
+        bridge._last_seen = time.time()
+        srv = bridge._Server(("127.0.0.1", 0), bridge._Handler)
+        port = srv.server_address[1]
+        t = threading.Thread(target=srv.serve_forever, daemon=True)
+        t.start()
+        try:
+            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+            conn.request("GET", "/debug")
+            r = conn.getresponse()
+            data = json.loads(r.read())
+            self.assertNotIn("api_keys", data.get("config", {}))
+            # secret không lộ trong recent_log
+            self.assertFalse(
+                any("secret_key_123" in s for s in data.get("recent_log", [])))
+        finally:
+            srv.shutdown()
+            srv.server_close()
+            t.join(2)
+
+    def test_generate_stream_emitted_raise_logs_debug(self):
+        """generate_stream raise sau partial stream ghi debug log."""
+        events = [
+            {"kind": "delta", "text": "partial"},
+            {"kind": "error", "message": "mid-stream boom"},
+        ]
+        pending = _fake_pending(events)
+        CONFIG["debug"] = True
+        CONFIG["log_requests"] = True
+        logged = []
+        orig_debug_log = bridge._debug_log
+        bridge._debug_log = lambda msg: logged.append(msg)
+        try:
+            with mock.patch.object(bridge, "worker_alive", return_value=True), \
+                    mock.patch.object(bridge, "_pending", pending):
+                with self.assertRaises(qwen.QwenError):
+                    list(bridge.generate_stream("hi", "m", False))
+            # Phải có log về partial stream raise
+            self.assertTrue(any("partial" in s or "raising" in s for s in logged),
+                            f"Expected partial-stream debug log, got: {logged}")
+        finally:
+            bridge._debug_log = orig_debug_log
+
+
+# --------------------------------------------- server large prompt log ----
+class TestServerLargePromptLog(_Sandbox):
+
+    def test_prepare_large_prompt_logs_split(self):
+        """prepare_large_prompt split path ghi debug_log."""
+        CONFIG["debug"] = True
+        CONFIG["log_requests"] = True
+        logged = []
+        with mock.patch("qwen_web2api.server.debug_log",
+                        side_effect=lambda m: logged.append(m)):
+            long_history = "X" * 135000
+            last_msg = {"role": "user", "content": "Y" * 100}
+            messages = [{"role": "user", "content": long_history}, last_msg]
+            fi, _msgs = server.prepare_large_prompt(messages)
+        try:
+            # Phải có log về split
+            self.assertTrue(any("split" in s for s in logged),
+                            f"Expected split debug log, got: {logged}")
+        finally:
+            if fi and fi.get("path"):
+                try:
+                    os.unlink(fi["path"])
+                except OSError:
+                    pass
+
+    def test_prepare_large_prompt_logs_fallback_reason(self):
+        """prepare_large_prompt fallback (1 message) ghi log lý do."""
+        CONFIG["log_requests"] = True
+        logged = []
+        with mock.patch("qwen_web2api.server.log",
+                        side_effect=lambda m: logged.append(m)):
+            long_single = {"role": "user", "content": "Z" * 140000}
+            fi, _msgs = server.prepare_large_prompt([long_single])
+        try:
+            # Phải log "cannot split" kèm lý do
+            self.assertTrue(any("cannot split" in s for s in logged),
+                            f"Expected fallback log, got: {logged}")
+        finally:
+            if fi and fi.get("path"):
+                try:
+                    os.unlink(fi["path"])
+                except OSError:
+                    pass
+
+    def test_prepare_large_prompt_no_log_when_under_limit(self):
+        """prepare_large_prompt không log gì khi prompt ngắn."""
+        logged = []
+        with mock.patch("qwen_web2api.server.log",
+                        side_effect=lambda m: logged.append(m)), \
+             mock.patch("qwen_web2api.server.debug_log",
+                        side_effect=lambda m: logged.append(m)):
+            fi, _msgs = server.prepare_large_prompt([
+                {"role": "user", "content": "short"}
+            ])
+        self.assertIsNone(fi)
+        self.assertEqual(logged, [])
 
 
 if __name__ == "__main__":

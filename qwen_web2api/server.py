@@ -14,7 +14,7 @@ from socketserver import ThreadingMixIn
 from . import __version__
 from .config import CONFIG
 from .models import MODELS, resolve_model
-from .qwen import QwenError, log
+from .qwen import QwenError, log, debug_log
 from . import bridge
 from .tools import (build_response_format_instruction, is_required_tool_choice,
                     looks_like_missed_tool_call, messages_to_prompt,
@@ -128,10 +128,18 @@ def prepare_large_prompt(messages, tools=None, tool_choice=None):
             "size": len(file_content),
             "attachment_prompt": companion_prompt,
         }
+        debug_log(f"large prompt split: history → file ({len(file_content)} chars), "
+                  f"companion prompt {len(companion_prompt)} chars")
         return file_info, [last_msg]
 
     # Fallback: Không thể tách (chỉ có 1 message, hoặc message cuối không phải user,
     # hoặc bản thân message cuối vượt MAX_PROMPT_CHARS). Ghi toàn bộ vào file.
+    last_role = (messages[-1].get("role") if messages else None) if messages else None
+    reason = ("only 1 message" if len(messages) <= 1
+              else f"last msg role={last_role!r}, not user"
+              if last_role != "user"
+              else f"last msg itself > MAX_PROMPT_CHARS ({len(companion_prompt)} chars)")
+    log(f"[bridge] large prompt: cannot split ({reason}), writing full prompt to file")
     fd, path = tempfile.mkstemp(suffix=".txt", prefix="qwen_prompt_")
     with os.fdopen(fd, "w", encoding="utf-8") as f:
         f.write(full_prompt)
@@ -484,6 +492,7 @@ class QwenHandler(BaseHTTPRequestHandler):
                 log("tool retry skipped: client disconnected")
                 break
             call_prompt = prompt + nudge if nudge else prompt
+            debug_log(f"run_turn attempt {attempt + 1}/{attempts} (tools_active={tools_active}, required_tool={bool(required_tool)})")
             if on_reasoning_delta:
                 content_parts = []
                 reasoning_parts = []
@@ -507,6 +516,7 @@ class QwenHandler(BaseHTTPRequestHandler):
             if tools_active and text:
                 text, calls, _dropped = parse_tool_calls(text, allowed, schemas)
             if calls:
+                debug_log(f"parsed {len(calls)} tool call(s): {[c['function']['name'] for c in calls]}")
                 missing = missing_required_params(calls, required_params)
                 if missing and attempt + 1 < attempts:
                     nudge = ("\n\nIMPORTANT: Your previous tool call was missing "
@@ -528,6 +538,7 @@ class QwenHandler(BaseHTTPRequestHandler):
                 break
             if tools_active and (looks_like_missed_tool_call(text)
                                  or not text.strip()):
+                debug_log("detected missed tool call; sending nudge retry")
                 nudge = ("\n\nIMPORTANT: Do not describe a tool call -- make it. "
                          "If answering requires reading or changing something, "
                          "call the tool now; otherwise give your final answer.")
@@ -651,6 +662,7 @@ class QwenHandler(BaseHTTPRequestHandler):
         if not prompt.strip():
             return self.send_api_error(400, "empty prompt", ERR_INVALID)
         stream = bool(req.get("stream"))
+        debug_log(f"chat request: model={echo}, messages={len(messages)}, stream={stream}, tools={len(tools) if tools else 0}")
         stops = _normalize_stop(req.get("stop"))
         max_tokens = req.get("max_tokens") or req.get("max_completion_tokens")
         include_usage = bool((req.get("stream_options") or {}).get("include_usage"))
@@ -809,7 +821,7 @@ class QwenHandler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             return
         except Exception as e:
-            log(f"stream error: {e}")
+            log(f"stream error [{model}, prompt_len={len(prompt)}]: {e}")
             try:
                 self._sse_error(*_map_error(e))
                 self._sse_done()
@@ -864,6 +876,7 @@ class QwenHandler(BaseHTTPRequestHandler):
         schemas = tool_parameters(tools) or None
         required_params = tool_required_params(tools) or None
         stream = bool(req.get("stream"))
+        debug_log(f"responses request: model={echo}, input_items={len(req.get('input', []))}, stream={stream}, tools={len(tools) if tools else 0}")
         rid = f"resp_{uuid.uuid4().hex[:16]}"
         created = int(time.time())
         seq = 0

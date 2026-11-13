@@ -10,6 +10,7 @@ Chay fetch() trong trang dung session that + header anti-bot that.
   * /requeue tra job ve hang doi khi extension phai navigate doi che do
     (temporary chat); /poll nhan them danh sach model de /v1/models merge.
 """
+import collections
 import json
 import queue
 import threading
@@ -29,10 +30,17 @@ _pending = queue.Queue()
 _jobs = {}
 _models = []
 _last_seen = 0.0
+# Reference to shared circular buffer in qwen.py
+_recent_log = qwen._recent_log
 
 
 def _log(msg):
     qwen.log("[bridge] " + msg)
+
+
+def _debug_log(msg):
+    if qwen.is_debug():
+        _log("[debug] " + msg)
 
 
 def worker_alive():
@@ -82,6 +90,7 @@ def status():
             "temporary_chat": temporary_chat_enabled(),
             "select_model": bool(CONFIG.get("bridge_select_model", True)),
             "attachment_prompt": str(CONFIG.get("attachment_prompt", "Please read the text and action")),
+            "debug": qwen.is_debug(),
             "models": n_models,
             "last_seen_ago": round(time.time() - _last_seen, 1)
             if _last_seen else None}
@@ -141,10 +150,12 @@ def generate_stream(prompt, model, think, usage_out=None, file_info=None):
             # Fallback (tin nhắn đơn quá dài hoặc không phải user): dùng attachment_prompt cấu hình,
             # không dùng prompt vì prompt fallback chứa "[Attached file: ...]" dễ khiến model gọi nhầm tool đọc file.
             att_prompt = str(CONFIG.get("attachment_prompt", "Please read the text and action"))
+        _debug_log(f"queueing job {jid} (model={model}, prompt_len={len(prompt or '')}, file={bool(file_info)})")
         _pending.put({"job_id": jid, "model": model, "prompt": prompt,
                       "think": bool(think), "ts": time.time(),
                       "file_info": file_info,
-                      "attachment_prompt": att_prompt})
+                      "attachment_prompt": att_prompt,
+                      "managed": True})
         tracker = _Tracker()
         emitted = False
         try:
@@ -152,6 +163,7 @@ def generate_stream(prompt, model, think, usage_out=None, file_info=None):
                 try:
                     ev = q.get(timeout=timeout)
                 except queue.Empty:
+                    _log(f"[orphan] job {jid} timed out after {timeout}s without response from browser tab")
                     raise qwen.QwenError(
                         "browser bridge: tab khong tra ket qua (timeout)",
                         status=504)
@@ -190,6 +202,8 @@ def generate_stream(prompt, model, think, usage_out=None, file_info=None):
                 elif kind == "usage":
                     if usage_out is not None and isinstance(ev.get("usage"), dict):
                         usage_out.update(ev["usage"])
+                elif kind in ("debug", "log"):
+                    _debug_log("extension: " + str(ev.get("message") or ""))
                 elif kind == "warn":
                     # Extension khong lam duoc thu gi do (model picker...) nhung
                     # request van chay tiep; chi ghi log de debug.
@@ -203,10 +217,12 @@ def generate_stream(prompt, model, think, usage_out=None, file_info=None):
                         raise qwen.QwenError(
                             "browser bridge: upstream khong tra ve text nao",
                             status=502)
+                    _debug_log(f"job {jid} completed successfully ({len(tracker.total['content'])} content, {len(tracker.total['reasoning'])} reasoning)")
                     return
         except Exception as e:
             last_err = e if isinstance(e, qwen.QwenError) else qwen.QwenError(str(e))
             if emitted:
+                _debug_log(f"job {jid} raising after partial stream: {last_err}")
                 raise last_err
             if attempt < attempts - 1:
                 _log(f"retry {attempt + 1}/{attempts}: {last_err}")
@@ -293,6 +309,29 @@ class _Handler(BaseHTTPRequestHandler):
 
         if path == "/status":
             return self._json(status())
+        if path == "/debug":
+            if not qwen.is_debug():
+                return self._json({"error": "debug mode not enabled; set \"debug\": true in config"}, 403)
+            with _lock:
+                n_jobs = len(_jobs)
+                n_models = len(_models)
+            safe_keys = ("debug", "log_requests", "temporary_chat", "temporary-chat",
+                         "bridge_select_model", "default_model", "retry_attempts",
+                         "bridge_job_timeout", "bridge_poll_wait", "bridge_worker_ttl",
+                         "attachment_prompt", "log_file", "bridge_port", "port")
+            cfg_snapshot = {k: CONFIG[k] for k in safe_keys if k in CONFIG}
+            return self._json({
+                "config": cfg_snapshot,
+                "bridge": {
+                    "worker_alive": worker_alive(),
+                    "last_seen_ago": round(time.time() - _last_seen, 1) if _last_seen else None,
+                    "pending_jobs": _pending.qsize(),
+                    "active_jobs": n_jobs,
+                    "known_models_count": n_models,
+                    "temporary_chat": temporary_chat_enabled(),
+                },
+                "recent_log": qwen.get_recent_log(),
+            })
         self._json({"error": "not found"}, 404)
 
     def do_POST(self):
@@ -328,24 +367,55 @@ class _Handler(BaseHTTPRequestHandler):
             return self._json({"ok": True})
 
         if path == "/poll":
+            worker = data.get("worker", "unknown")
             deadline = time.time() + float(CONFIG.get("bridge_poll_wait", 20))
             ttl = float(CONFIG.get("bridge_job_timeout", 300))
             while True:
                 remaining = deadline - time.time()
                 if remaining <= 0:
+                    _debug_log(f"poll: no job after {CONFIG.get('bridge_poll_wait', 20)}s (queue empty)")
                     return self._json({"job": None})
                 try:
                     job = _pending.get(timeout=remaining)
                 except queue.Empty:
+                    _debug_log(f"poll: no job after {CONFIG.get('bridge_poll_wait', 20)}s (queue empty)")
                     return self._json({"job": None})
-                if time.time() - job.get("ts", 0) <= ttl:
-                    return self._json({"job": job})
+
+                jid = job.get("job_id")
+                age = time.time() - job.get("ts", 0)
+                if age > ttl:
+                    _log(f"[orphan] dropping expired job {jid} (queued {age:.1f}s > ttl {ttl}s)")
+                    continue
+
+                if job.get("managed"):
+                    with _lock:
+                        is_active = jid in _jobs
+                    if not is_active:
+                        _log(f"[orphan] dropping orphan job {jid} (caller disconnected or cancelled)")
+                        continue
+
+                _debug_log(f"worker '{worker}' polled job {jid} (model={job.get('model')}, age={age:.1f}s)")
+                return self._json({"job": job})
 
         if path == "/event":
+            jid = data.get("job_id")
+            kind = data.get("kind")
             with _lock:
-                q = _jobs.get(data.get("job_id"))
+                q = _jobs.get(jid)
             if q is not None:
                 q.put(data)
+            else:
+                # Job khong con trong _jobs (da ket thuc hoac tab reload sau khi job da settled/timed out)
+                if kind not in ("ping",):
+                    msg = data.get("message") or ""
+                    if jid in (None, "", "none"):
+                        _log(f"extension warn: {msg}")
+                    elif data.get("tab_reloaded") or data.get("tab_reloading"):
+                        _log(f"extension warn: {msg}")
+                    elif kind == "warn":
+                        _log(f"extension warn (orphan job {jid}): {msg}")
+                    else:
+                        _debug_log(f"event '{kind}' for unknown/orphan job {jid}: {msg}")
             return self._json({"ok": True})
 
         self._json({"error": "not found"}, 404)
