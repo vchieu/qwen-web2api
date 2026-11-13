@@ -1,9 +1,11 @@
 /* Qwen Web2API UI bridge.
-   Khong dung fetch tu dung request nua.
+   Khong tu fetch completions nua (payload do app tu gui).
+   - Chon temporary chat / model trong UI theo job (best-effort, warn neu loi).
    - Tu dien composer, bam send (hoac Enter).
    - Hook fetch/XHR de bat SSE tu chinh request cua app.
    - Day delta ve proxy local.
-   Giu tab chat.qwen.ai mo, dang nhap, va chon model/thinking trong UI. */
+   Giu tab chat.qwen.ai mo, dang nhap. GET /api/v2/models chi de do danh
+   sach model cho picker; temporary mode co the navigate mot lan. */
 (() => {
   if (window.__qwenUIBridge) return;
   window.__qwenUIBridge = true;
@@ -12,11 +14,27 @@
   const BASE = location.origin;
   const MAX_JOBS = 1;
   const NEW_CHAT_EACH_JOB = true;   // thu bam New Chat truoc moi job
-  const SEND_TIMEOUT_MS = 180000;
+  const SEND_TIMEOUT_MS = 90000;    // Timeout de dien UI va cho completion response bat dau
+  const STREAM_IDLE_TIMEOUT_MS = 180000; // 3 phut khong co bat ky chunk nao moi coi la stream treo
   const COMPOSER_WAIT_MS = 15000;
+  const MODEL_REFRESH_MS = 10 * 60 * 1000;
+  const MODE_CHECK_MS = 5000;
+  const MODE_NAV_KEY = "qwenUIBridgeModeNav";
+  const MODE_NAV_WINDOW_MS = 60000;
+  const MODE_NAV_MAX = 2;
+  const ATTACHMENT_COMPANION_PROMPT = "Please read the text and action";
 
+  let pageLoadedAsTemporary = /[?&]temporary-chat=true/.test(location.search)
+    || /[?&]temporary-chat=true/.test(location.href);
   let active = 0;
+  let navigating = false;
   let current = null;
+  let knownModels = [];
+  let lastRawDeltas = [];
+  let lastModelRefresh = 0;
+  let lastModeCheck = 0;
+  let selectModelEnabled = true;
+  let attachmentPrompt = ATTACHMENT_COMPANION_PROMPT;
 
   const log = (...a) => console.log("[qwen-ui-bridge]", ...a);
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -45,6 +63,301 @@
       send(job.id, { kind: "error", message: msg }).finally(() => job.reject(err));
     } else {
       send(job.id, { kind: "done" }).finally(() => job.resolve());
+    }
+  }
+
+  // ----------------------------------------- models / temporary-chat mode --
+  function textOf(el) {
+    if (!el) return "";
+    return String(el.getAttribute("aria-label") || el.getAttribute("title")
+      || el.innerText || el.textContent || "").trim();
+  }
+
+  function normLabel(s) {
+    return String(s || "")
+      .toLowerCase()
+      .replace(/\.0\b/g, "")
+      .replace(/[^a-z0-9]+/g, "");
+  }
+
+  // Qwen doi shape theo phase: string, mang part ({type,text}) hay object
+  // {content:[...]}. Gom ve 1 string de khong lam mat thinking.
+  function partsText(v) {
+    if (typeof v === "string") return v;
+    if (Array.isArray(v)) return v.map(partsText).join("");
+    if (v && typeof v === "object") {
+      if (typeof v.text === "string") return v.text;
+      if (v.content !== undefined) return partsText(v.content);
+    }
+    return "";
+  }
+
+  // Gom content cua summary (string | mang string | mang part | {content}) thanh
+  // 1 string, moi phan cach nhau bang `sep`.
+  function joinParts(v, sep) {
+    const raw = (v && typeof v === "object" && !Array.isArray(v)
+      && v.content !== undefined) ? v.content : v;
+    const list = Array.isArray(raw) ? raw : (raw == null ? [] : [raw]);
+    return list.map((p) => partsText(p).trim()).filter(Boolean).join(sep);
+  }
+
+  function labelMatches(targets, text) {
+    const n = normLabel(text);
+    if (!n) return false;
+    return (targets || []).some((t) => {
+      const tn = normLabel(t);
+      return tn && (n === tn || n.includes(tn));
+    });
+  }
+
+  function pressEscape() {
+    const opts = { key: "Escape", code: "Escape", keyCode: 27, which: 27, bubbles: true };
+    const el = document.activeElement || document.body;
+    if (!el) return;
+    el.dispatchEvent(new KeyboardEvent("keydown", opts));
+    el.dispatchEvent(new KeyboardEvent("keyup", opts));
+  }
+
+  async function getJSON(path) {
+    const r = await fetch(BRIDGE + path);
+    if (!r.ok) throw new Error("bridge " + path + " -> " + r.status);
+    return r.json();
+  }
+
+  async function readStatus() {
+    const st = await getJSON("/status");
+    if (st && typeof st.select_model === "boolean") selectModelEnabled = st.select_model;
+    if (st && typeof st.attachment_prompt === "string" && st.attachment_prompt.trim()) {
+      attachmentPrompt = st.attachment_prompt.trim();
+    }
+    return st || {};
+  }
+
+  // Throttled: lay danh sach model tu chinh API cua trang (chi de do picker).
+  async function refreshModels(force) {
+    const now = Date.now();
+    if (!force && now - lastModelRefresh < MODEL_REFRESH_MS) return knownModels;
+    try {
+      const r = await origFetch(BASE + "/api/v2/models", {
+        headers: { accept: "application/json" },
+        credentials: "same-origin",
+      });
+      if (!r.ok) throw new Error("models -> " + r.status);
+      const data = await r.json();
+      const src = data && data.data;
+      const list = Array.isArray(src)
+        ? src
+        : (src && (src.data || src.models || src.list));
+      const out = [];
+      for (const m of Array.isArray(list) ? list : []) {
+        if (!m || typeof m.id !== "string" || !m.id.trim()) continue;
+        const id = m.id.trim();
+        const name = (typeof m.name === "string" && m.name.trim()) || id;
+        out.push({ id: id, name: name });
+      }
+      if (out.length) {
+        knownModels = out;
+        lastModelRefresh = now;
+      }
+    } catch (e) {
+      log("model refresh skipped:", (e && e.message) || e);
+    }
+    return knownModels;
+  }
+
+  function modelTargets(model) {
+    if (!model) return [];
+    const raw = String(model).split("@think=")[0].trim();
+    if (!raw) return [];
+    const targetNorm = normLabel(raw);
+    const labels = [raw];
+    for (const m of knownModels) {
+      if (!m || !m.id) continue;
+      if (m.id === raw || normLabel(m.id) === targetNorm) {
+        labels.push(m.id);
+        if (m.name) labels.push(m.name);
+      }
+    }
+    const out = [];
+    for (const l of labels) {
+      const t = String(l || "").trim();
+      if (!t) continue;
+      if (!out.includes(t)) out.push(t);
+      const n = normLabel(t);
+      if (n && !out.includes(n)) out.push(n);
+    }
+    return out;
+  }
+
+  function findModelTrigger(targets) {
+    const nodes = Array.from(document.querySelectorAll(
+      'button, [role="button"], [role="combobox"], [aria-haspopup], [class*="model" i]'
+    ));
+    const norms = (targets || []).map(normLabel).filter(Boolean);
+    let best = null, bestScore = 0;
+    for (const el of nodes) {
+      if (!visible(el)) continue;
+      const label = textOf(el);
+      if (!label) continue;
+      const low = label.toLowerCase();
+      if (/^(send|stop|gửi|dừng)/i.test(low)) continue;
+      const n = normLabel(label);
+      let score = 0;
+      if (norms.includes(n)) score += 5;
+      else if (norms.some((t) => t && n.includes(t)
+        && Math.abs(n.length - t.length) <= 3)) score += 3;
+      const hint = ((el.getAttribute("aria-label") || "") + " "
+        + (el.getAttribute("title") || "")).toLowerCase();
+      if (/model|mô hình/.test(hint)) score += 2;
+      if (/^(qwen|qwq)/.test(n)) score += 2;
+      if (el.closest("form")) score -= 2;
+      if (el.matches('button, [role="button"], [role="combobox"], [aria-haspopup]')) score += 1;
+      if (score > bestScore) { best = el; bestScore = score; }
+    }
+    return bestScore >= 3 ? best : null;
+  }
+
+  // Chon model theo job.model. Loi UI chi warn, request van chay tiep.
+  async function selectModel(job) {
+    try {
+      if (!job || !job.model || selectModelEnabled === false) return true;
+      const targets = modelTargets(job.model);
+      if (!targets.length) return true;
+      const trigger = findModelTrigger(targets);
+      if (!trigger) {
+        send(job.id, { kind: "warn",
+          message: "khong tim thay model picker de chon " + job.model });
+        return false;
+      }
+      if (labelMatches(targets, textOf(trigger))) return true;
+
+      trigger.click();
+      await sleep(600);
+      const norms = targets.map(normLabel).filter(Boolean);
+      const options = Array.from(document.querySelectorAll(
+        '[role="option"], [role="menuitem"], [role="menuitemradio"], li, button, [role="button"]'
+      )).filter((el) => visible(el)
+        && !trigger.contains(el) && !el.contains(trigger));
+      let best = null, bestScore = 0;
+      for (const el of options) {
+        const n = normLabel(textOf(el));
+        if (!n) continue;
+        let score = 0;
+        if (norms.includes(n)) score += 5;
+        else if (norms.some((t) => n.startsWith(t) || n.includes(t))) score += 4;
+        else if (norms.some((t) => t.length >= 5 && n.length >= 4 && t.includes(n))) score += 2;
+        if (el.closest("form")) score -= 1;
+        if (score > bestScore) { best = el; bestScore = score; }
+      }
+      if (!best) {
+        pressEscape();
+        send(job.id, { kind: "warn",
+          message: "khong chon duoc model " + job.model + " trong UI" });
+        return false;
+      }
+      best.click();
+      await sleep(600);
+      const ok = labelMatches(targets, textOf(trigger));
+      if (!ok) {
+        send(job.id, { kind: "warn",
+          message: "UI chua hien model " + job.model + " sau khi chon" });
+      }
+      return ok;
+    } catch (e) {
+      send(job.id, { kind: "warn",
+        message: "model select error: " + ((e && e.message) || e) });
+      return false;
+    }
+  }
+
+  function isTemporaryPage() {
+    if (pageLoadedAsTemporary) return true;
+    if (/[?&]temporary-chat=true/.test(location.search) || /[?&]temporary-chat=true/.test(location.href)) {
+      pageLoadedAsTemporary = true;
+      return true;
+    }
+    const tempEl = document.querySelector(
+      '[class*="temporary" i], [data-testid*="temporary" i], [aria-label*="temporary" i], [title*="temporary" i]'
+    );
+    if (tempEl && visible(tempEl)) return true;
+    const bodyText = (document.body && document.body.innerText) || "";
+    if (/temporary\s*chat\s*(is\s*on|enabled|bật|đang\s*bật)|cuộc\s*trò\s*chuyện\s*tạm\s*thời|临时对话/i.test(bodyText)) {
+      pageLoadedAsTemporary = true;
+      return true;
+    }
+    return false;
+  }
+
+  function modeUrl(want) {
+    return BASE + (want ? "/?temporary-chat=true" : "/");
+  }
+
+  // Gioi han so lan tu navigate de doi temporary mode: tranh reload lap vo han
+  // khi app tu xoa ?temporary-chat=true khoi URL.
+  function allowIdleModeNav() {
+    const now = Date.now();
+    try {
+      const prev = JSON.parse(sessionStorage.getItem(MODE_NAV_KEY) || "{}") || {};
+      const recent = prev.at && now - prev.at < MODE_NAV_WINDOW_MS;
+      const n = recent ? (prev.n || 0) : 0;
+      if (n >= MODE_NAV_MAX) return false;
+      sessionStorage.setItem(MODE_NAV_KEY, JSON.stringify({ at: now, n: n + 1 }));
+      return true;
+    } catch (e) {
+      return true;
+    }
+  }
+
+  // Doi temporary mode truoc khi gui. Tra ve false neu phai navigate lai.
+  async function ensureMode(job) {
+    try {
+      const st = await readStatus();
+      if (typeof st.temporary_chat !== "boolean") return true;
+      const want = st.temporary_chat;
+      if (want === isTemporaryPage()) return true;
+      job.mode_retries = (job.mode_retries || 0) + 1;
+      if (job.mode_retries > 2) {
+        send(job.id, { kind: "warn",
+          message: "khong doi duoc temporary_chat=" + want
+            + "; tiep tuc voi che do hien tai" });
+        return true;
+      }
+      try {
+        job.raw.mode_retries = job.mode_retries;
+        await post("/requeue", { job: job.raw });
+      } catch (e) { /* best-effort */ }
+      navigating = true;
+      location.assign(modeUrl(want));
+      return false;
+    } catch (e) {
+      log("mode check skipped:", (e && e.message) || e);
+      return true;
+    }
+  }
+
+  // Khi ranh: bao dam tab dang o dung temporary mode (khong co job de requeue).
+  async function idleModeCheck() {
+    const now = Date.now();
+    if (now - lastModeCheck < MODE_CHECK_MS) return true;
+    lastModeCheck = now;
+    try {
+      const st = await readStatus();
+      if (typeof st.temporary_chat !== "boolean") return true;
+      if (st.temporary_chat === isTemporaryPage()) {
+        try { sessionStorage.removeItem(MODE_NAV_KEY); } catch (e) { /* best-effort */ }
+        return true;
+      }
+      if (!allowIdleModeNav()) {
+        log("temporary mode khong giu duoc sau " + MODE_NAV_MAX
+          + " lan navigate; dung thu lai");
+        return true;
+      }
+      navigating = true;
+      location.assign(modeUrl(st.temporary_chat));
+      return false;
+    } catch (e) {
+      log("idle mode check skipped:", (e && e.message) || e);
+      return true;
     }
   }
 
@@ -99,6 +412,25 @@
     return true;
   }
 
+  // Chan doan: delta co du lieu la nhung khong key nao duoc doc -> bao 1 lan
+  // (kem phase + keys) de biet Qwen doi shape; xem __qwenUIBridgeDump().
+  function noteShape(job, phase, d) {
+    if (!job || !d || typeof d !== "object") return;
+    const keys = Object.keys(d).filter((k) => k !== "phase"
+      && k !== "status" && k !== "role");
+    if (!keys.length) return;
+    if (!keys.some((k) => k !== "content" && k !== "extra")) return;
+    if (partsText(d.content) || partsText(d.reasoning_content)
+        || (d.extra && partsText(d.extra.summary_thought))) return;
+    const sig = String(phase || "") + "|" + keys.join(",");
+    if (!job._shapes) job._shapes = new Set();
+    if (job._shapes.has(sig)) return;
+    job._shapes.add(sig);
+    send(job.id, { kind: "warn",
+      message: "delta khong doc duoc phase=" + (phase || "(none)")
+        + " keys=" + keys.join(",") });
+  }
+
   async function handleData(job, data) {
     if (!job || job.settled) return;
     if (!data || data === "[DONE]") {
@@ -114,13 +446,15 @@
     if (obj.ret) throw new Error(JSON.stringify(obj).slice(0, 300));
     if (obj.usage) await send(job.id, { kind: "usage", usage: obj.usage });
 
-    // Khởi tạo biến lưu text thinking cũ để tránh gửi trùng lặp (do Qwen hay gửi cumulative array)
-    if (typeof job._lastThought !== "string") job._lastThought = "";
-
     for (const ch of obj.choices || []) {
       const d = ch.delta || ch.message || {};
       const phase = d.phase || "";
       const status = d.status || "";
+      const thinkPhase = String(phase || "").toLowerCase();
+      const isSummary = thinkPhase.includes("summary");
+      const isThinking = !isSummary
+        && (thinkPhase === "thinking" || thinkPhase === "think"
+            || thinkPhase === "reasoning");
 
       // 0. Native function_call: Qwen đang gọi tool bằng structured call.
       // Chỉ can thiệp khi prompt có block "# Tool Use" (client khai báo tools);
@@ -145,57 +479,91 @@
         continue;
       }
 
-      // 1. Lấy Full Thinking (nếu Qwen trả về phase="thinking" hoặc có reasoning_content)
-      if (typeof d.reasoning_content === "string" && d.reasoning_content) {
-        await send(job.id, { kind: "delta", phase: "reasoning", text: d.reasoning_content });
-      } else if ((phase === "thinking" || phase === "think") && typeof d.content === "string" && d.content) {
-        await send(job.id, { kind: "delta", phase: "reasoning", text: d.content });
+      // 1. Full Thinking: reasoning_content, hoac content cua phase thinking
+      // (string | array parts deu duoc).
+      const reasoningText = partsText(d.reasoning_content);
+      if (reasoningText) {
+        await send(job.id, { kind: "delta", phase: "reasoning", text: reasoningText });
+      } else if (isThinking) {
+        const thinkText = partsText(d.content);
+        if (thinkText) {
+          await send(job.id, { kind: "delta", phase: "reasoning", text: thinkText });
+        }
       }
 
-      // 2. Lấy Summary Thinking (phase="thinking_summary")
-      if (phase === "thinking_summary" && d.extra) {
-        let thoughtText = "";
-        if (d.extra.summary_thought && Array.isArray(d.extra.summary_thought.content)) {
-          thoughtText = d.extra.summary_thought.content.join("");
-        } else if (typeof d.extra.summary_thought === "string") {
-          thoughtText = d.extra.summary_thought;
+      // 2. Summary Thinking:
+      if (isSummary) {
+        if (status === "finished") {
+          job._blockFinished = true;
+          continue;
         }
-        
-        // Lấy thêm Title (nếu có) để làm tiêu đề in đậm
-        let titleText = "";
-        if (d.extra.summary_title && Array.isArray(d.extra.summary_title.content)) {
-          titleText = d.extra.summary_title.content.join("");
+        const extra = d.extra || {};
+
+        // 2a. Title: in đậm từng step title khi xuất hiện
+        const rawTitles = (extra.summary_title && extra.summary_title.content !== undefined)
+          ? extra.summary_title.content : extra.summary_title;
+        const titleList = Array.isArray(rawTitles) ? rawTitles : (rawTitles ? [rawTitles] : []);
+        if (titleList.length > 0) {
+          if (!job._seenTitles) job._seenTitles = new Set();
+          for (const item of titleList) {
+            const t = partsText(item).trim();
+            if (t && !job._seenTitles.has(t)) {
+              job._seenTitles.add(t);
+              await send(job.id, {
+                kind: "delta",
+                phase: "reasoning",
+                text: `**${t}**\n\n`
+              });
+            }
+          }
         }
 
-        if (thoughtText && thoughtText !== job._lastThought) {
-          // Chỉ gửi phần text mới (delta) để tránh client bị lặp chữ
-          let delta = thoughtText.slice(job._lastThought.length);
-          job._lastThought = thoughtText;
-          
-          if (delta) {
-            // Nếu đây là chunk đầu tiên và có title, prepend title vào
-            if (job._lastThought === thoughtText && titleText && !job._titleSent) {
-               delta = `**${titleText}**\n\n${delta}`;
-               job._titleSent = true;
+        // 2b. Thought: xử lý cumulative arrays hoặc disjoint blocks
+        const thoughtText = joinParts(extra.summary_thought, "\n\n");
+        if (typeof job._thinkThought !== "string") job._thinkThought = "";
+        if (thoughtText && thoughtText !== job._thinkThought) {
+          let delta = "";
+          if (job._thinkThought && thoughtText.startsWith(job._thinkThought)) {
+            delta = thoughtText.slice(job._thinkThought.length);
+            job._thinkThought = thoughtText;
+          } else if (job._blockFinished && !thoughtText.startsWith(job._thinkThought)) {
+            delta = "\n\n" + thoughtText;
+            job._thinkThought = (job._thinkThought ? job._thinkThought + "\n\n" : "") + thoughtText;
+          } else if (!job._thinkThought) {
+            delta = thoughtText;
+            job._thinkThought = thoughtText;
+          } else {
+            // Tiền tố có khác biệt nhỏ: tìm common prefix
+            let p = 0;
+            while (p < job._thinkThought.length && p < thoughtText.length
+                   && job._thinkThought[p] === thoughtText[p]) {
+              p++;
             }
+            delta = thoughtText.slice(p);
+            job._thinkThought = thoughtText;
+          }
+          job._blockFinished = false;
+          if (delta) {
             await send(job.id, { kind: "delta", phase: "reasoning", text: delta });
           }
         }
+        continue;
       }
 
-      // 3. Lấy Final Answer (phase="answer" hoặc không có phase)
-      const isAnswer = phase === "answer" || phase === "" || !phase;
+      // 3. Final Answer: moi phase khong phai thinking/summary deu la answer.
+      const isAnswer = !isThinking && !isSummary;
       if (isAnswer) {
-        if (typeof d.content === "string" && d.content) {
-          await send(job.id, { kind: "delta", phase: "content", text: d.content });
-        } else if (Array.isArray(d.content)) {
-          for (const p of d.content) {
-            if (p && typeof p.text === "string" && p.text) {
-              await send(job.id, { kind: "delta", phase: "content", text: p.text });
-            }
+        const answerText = partsText(d.content);
+        if (answerText) {
+          if (answerText.includes("The current content is empty, please regenerate")
+              || answerText.includes("当前内容为空，请重新生成")) {
+            throw new Error("Qwen error: The current content is empty, please regenerate.");
           }
+          await send(job.id, { kind: "delta", phase: "content", text: answerText });
         }
       }
+
+      noteShape(job, phase, d);
     }
   }
 
@@ -205,21 +573,40 @@
       const text = await resp.text();
       throw new Error("non-SSE (" + resp.status + "): " + text.slice(0, 400));
     }
+
+    let idleTimer = null;
+    const resetIdleTimer = () => {
+      if (idleTimer) clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => {
+        settle(job, new Error("Upstream stream timeout: khong nhan duoc du lieu tu Qwen sau " + (STREAM_IDLE_TIMEOUT_MS / 1000) + "s"));
+      }, STREAM_IDLE_TIMEOUT_MS);
+    };
+    resetIdleTimer();
+
     const reader = resp.body.getReader();
     const dec = new TextDecoder();
     let buf = "";
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      if (job.settled) break;
-      buf += dec.decode(value, { stream: true });
-      let idx;
-      while ((idx = buf.indexOf("\n")) >= 0) {
-        const line = buf.slice(0, idx).trim();
-        buf = buf.slice(idx + 1);
-        if (!line.startsWith("data:")) continue;
-        await handleData(job, line.slice(5).trim());
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (job.settled) break;
+        resetIdleTimer();
+        buf += dec.decode(value, { stream: true });
+        let idx;
+        while ((idx = buf.indexOf("\n")) >= 0) {
+          const line = buf.slice(0, idx).trim();
+          buf = buf.slice(idx + 1);
+          if (!line.startsWith("data:")) continue;
+          if (/think|reason|summar/i.test(line)) {
+            lastRawDeltas.push(line.slice(0, 500));
+            if (lastRawDeltas.length > 20) lastRawDeltas.shift();
+          }
+          await handleData(job, line.slice(5).trim());
+        }
       }
+    } finally {
+      if (idleTimer) clearTimeout(idleTimer);
     }
     settle(job, null);
   }
@@ -241,6 +628,9 @@
     try {
       if (current && !current.attached && isCompletionURL(urlOf(input))) {
         current.attached = true;
+        if (typeof current._clearSendTimer === "function") {
+          current._clearSendTimer();
+        }
         const clone = resp.clone();
         pumpFetch(current, clone).catch((e) => settle(current, e));
       }
@@ -258,6 +648,9 @@
   XMLHttpRequest.prototype.send = function (body) {
     if (current && !current.attached && isCompletionURL(this.__qwenURL)) {
       current.attached = true;
+      if (typeof current._clearSendTimer === "function") {
+        current._clearSendTimer();
+      }
       const job = current;
       this.addEventListener("load", () => {
         parseSSEText(job, this.responseText).catch((e) => settle(job, e));
@@ -344,9 +737,15 @@
 
   async function tryNewChat() {
     if (!NEW_CHAT_EACH_JOB) return;
+    const st = await readStatus();
+    const wantTemp = st && st.temporary_chat;
     const btn = findNewChatButton();
     if (!btn) {
       log("khong tim thay nut New Chat; se gui trong chat hien tai");
+      return;
+    }
+    if (wantTemp && btn.tagName === "A" && btn.getAttribute("href") === "/") {
+      log("dang o temporary chat mode; khong click link href=/ de tranh thoat temporary");
       return;
     }
     btn.click();
@@ -382,6 +781,13 @@
   async function submitPrompt(composer, prompt) {
     setComposer(composer, prompt);
     await sleep(350);
+    // Neu UI tu dong chuyen text vua paste/nhap thanh attachment card va lam rong composer:
+    if (!composerText(composer).trim()) {
+      const companion = attachmentPrompt || ATTACHMENT_COMPANION_PROMPT;
+      log("composer empty after setting prompt; inserting companion prompt:", companion);
+      setComposerClean(composer, companion);
+      await sleep(350);
+    }
     const btn = findSendButton(composer);
     if (btn) {
       btn.click();
@@ -526,7 +932,8 @@
 
   // Prompt quá dài: paste để Qwen tự tạo document txt; nếu UI bỏ qua paste thì
   // thử upload file, cuối cùng mới gửi nguyên text.
-  async function attachLongPrompt(composer, fileInfo) {
+  async function attachLongPrompt(composer, fileInfo, companionPrompt) {
+    const promptText = companionPrompt || attachmentPrompt || ATTACHMENT_COMPANION_PROMPT;
     const text = await fetchPromptText(fileInfo);
     const before = attachmentSnapshot();
 
@@ -551,11 +958,13 @@
     }
 
     if (attached) {
-      // Toàn bộ prompt đã nằm trong document. Không gửi kèm text nào để Qwen
-      // không tưởng phải gọi tool read cho tên file tạm qwen_prompt_*.txt.
+      // Toàn bộ prompt đã nằm trong document/pasted text. Gửi kèm prompt ngắn
+      // (ví dụ "Please read the text and action", không chứa tên file tạm)
+      // để Qwen không báo "The current content is empty, please regenerate."
+      // và không nhầm với file trên máy để gọi tool read.
       await sleep(800);
-      setComposerClean(composer, "");
-      log("large prompt attached; composer cleared");
+      setComposerClean(composer, promptText);
+      log("large prompt attached; set companion prompt:", promptText);
     } else {
       // Không tạo được attachment: gửi trực tiếp toàn bộ prompt đã render
       // (file text đã chứa cả tool block + nội dung gốc).
@@ -567,7 +976,8 @@
 
   // Chờ send button sẵn sàng (thường là sau khi upload xong) rồi bấm.
   // Nếu UI chưa nhận, thử lại vài lần.
-  async function sendPrompt(composer, timeoutMs = 45000) {
+  async function sendPrompt(composer, timeoutMs = 45000, fallbackPrompt = null) {
+    const companion = fallbackPrompt || attachmentPrompt || ATTACHMENT_COMPANION_PROMPT;
     const deadline = Date.now() + timeoutMs;
     let clicks = 0;
     while (Date.now() < deadline) {
@@ -575,6 +985,12 @@
       if (!btn) {
         await sleep(400);
         continue;
+      }
+      // Tránh gửi rỗng khi có attachment/pasted text khiến Qwen trả về "The current content is empty, please regenerate."
+      if (!composerText(composer).trim()) {
+        log("composer is empty before sending; inserting companion prompt:", companion);
+        setComposerClean(composer, companion);
+        await sleep(350);
       }
       const hadText = !!composerText(composer).trim();
       btn.click();
@@ -591,17 +1007,25 @@
 
   async function runJob(job) {
     current = job;
-    const timer = setTimeout(() => {
+    let sendTimer = setTimeout(() => {
       settle(job, new Error("UI send timeout: khong bat duoc completion response"));
     }, SEND_TIMEOUT_MS);
+    job._clearSendTimer = () => {
+      if (sendTimer) {
+        clearTimeout(sendTimer);
+        sendTimer = null;
+      }
+    };
     try {
       await tryNewChat();
+      if (!(await ensureMode(job))) return;
+      await selectModel(job);
       const composer = await waitComposer();
 
       if (job.file_info) {
         // Large prompt: paste/upload de Qwen tao document, roi gui attachment.
-        await attachLongPrompt(composer, job.file_info);
-        await sendPrompt(composer);
+        await attachLongPrompt(composer, job.file_info, job.attachment_prompt);
+        await sendPrompt(composer, 45000, job.attachment_prompt);
       } else {
         // Normal flow
         await submitPrompt(composer, job.prompt);
@@ -610,7 +1034,7 @@
     } catch (e) {
       settle(job, e);
     } finally {
-      clearTimeout(timer);
+      if (typeof job._clearSendTimer === "function") job._clearSendTimer();
       current = null;
     }
   }
@@ -620,9 +1044,12 @@
   async function loop() {
     log("started on", BASE, "->", BRIDGE);
     for (;;) {
+      if (navigating) { await sleep(500); continue; }
       if (active >= MAX_JOBS) { await sleep(400); continue; }
       try {
-        const r = await post("/poll", { worker: location.host });
+        await refreshModels(false);
+        if (!(await idleModeCheck())) { await sleep(500); continue; }
+        const r = await post("/poll", { worker: location.host, models: knownModels });
         if (r && r.job) {
           active++;
           const job = {
@@ -631,6 +1058,9 @@
             prompt: r.job.prompt,
             think: r.job.think,
             file_info: r.job.file_info,
+            attachment_prompt: r.job.attachment_prompt || attachmentPrompt || ATTACHMENT_COMPANION_PROMPT,
+            raw: r.job,
+            mode_retries: r.job.mode_retries || 0,
             toolsActive: String(r.job.prompt || "").includes("# Tool Use"),
             attached: false,
             settled: false,
@@ -652,6 +1082,12 @@
     console.log("new chat:", findNewChatButton());
     const c = findComposers()[0];
     console.log("send button:", c ? findSendButton(c) : null);
+    console.log("temporary chat page:", isTemporaryPage());
+    console.log("known models:", knownModels, "select enabled:", selectModelEnabled);
+    const trigger = findModelTrigger(
+      knownModels.map((m) => m.id || "").filter(Boolean));
+    console.log("model trigger:", trigger, trigger ? textOf(trigger) : "");
+    console.log("last raw thinking deltas:", lastRawDeltas);
   };
 
   loop();

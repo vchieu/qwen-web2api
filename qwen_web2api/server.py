@@ -14,7 +14,8 @@ from socketserver import ThreadingMixIn
 from . import __version__
 from .config import CONFIG
 from .models import MODELS, resolve_model
-from .qwen import QwenError, generate, generate_stream, log, upstream_models
+from .qwen import QwenError, log
+from . import bridge
 from .tools import (build_response_format_instruction, is_required_tool_choice,
                     looks_like_missed_tool_call, messages_to_prompt,
                     missing_required_params, parse_tool_calls, strip_code_fence,
@@ -418,7 +419,7 @@ class QwenHandler(BaseHTTPRequestHandler):
         base = raw.split("@think=")[0] if isinstance(raw, str) else raw
         if (CONFIG.get("strict_models") and isinstance(base, str) and base
                 and base not in MODELS
-                and not any(m["id"] == base for m in upstream_models())):
+                and not any(m["id"] == base for m in bridge.known_models())):
             self.send_api_error(404, f"model '{raw}' not found",
                                 ERR_INVALID, "model_not_found")
             return None
@@ -444,7 +445,7 @@ class QwenHandler(BaseHTTPRequestHandler):
     # ---------------------------------------------------------- tool turn --
     def _run_turn(self, prompt, upstream, think, tools_active, allowed,
                   schemas, required_params, required_tool, client_gone=None,
-                  file_info=None):
+                  file_info=None, on_reasoning_delta=None):
         attempts = 1
         if required_tool or (tools_active and CONFIG.get("tool_retry_on_miss")):
             attempts = 1 + max(0, int(CONFIG.get("tool_retry_attempts", 1)))
@@ -455,9 +456,25 @@ class QwenHandler(BaseHTTPRequestHandler):
                 log("tool retry skipped: client disconnected")
                 break
             call_prompt = prompt + nudge if nudge else prompt
-            result = generate(call_prompt, upstream, think, file_info=file_info)
-            text, reasoning, usage = (result["content"], result["reasoning"],
-                                      result["usage"])
+            if on_reasoning_delta:
+                content_parts = []
+                reasoning_parts = []
+                usage = {}
+                for kind, delta in bridge.generate_stream(
+                        call_prompt, upstream, think, usage, file_info=file_info):
+                    if client_gone is not None and client_gone.is_set():
+                        break
+                    if kind == "reasoning":
+                        reasoning_parts.append(delta)
+                        on_reasoning_delta(delta)
+                    else:
+                        content_parts.append(delta)
+                text = "".join(content_parts)
+                reasoning = "".join(reasoning_parts)
+            else:
+                result = bridge.generate(call_prompt, upstream, think, file_info=file_info)
+                text, reasoning, usage = (result["content"], result["reasoning"],
+                                          result["usage"])
             calls = None
             if tools_active and text:
                 text, calls, _dropped = parse_tool_calls(text, allowed, schemas)
@@ -518,7 +535,7 @@ class QwenHandler(BaseHTTPRequestHandler):
                     data.append({"id": n, "object": "model",
                                  "created": 1700000000, "owned_by": "qwen",
                                  "description": c.get("desc", "")})
-                for m in upstream_models():
+                for m in bridge.known_models():
                     if m["id"] not in seen:
                         seen.add(m["id"])
                         data.append({"id": m["id"], "object": "model",
@@ -527,7 +544,7 @@ class QwenHandler(BaseHTTPRequestHandler):
                 self.send_json({"object": "list", "data": data})
             elif path.startswith("/v1/models/") or path.startswith("/models/"):
                 mid = path.rsplit("/", 1)[-1]
-                if mid in MODELS or any(m["id"] == mid for m in upstream_models()):
+                if mid in MODELS or any(m["id"] == mid for m in bridge.known_models()):
                     self.send_json({"id": mid, "object": "model",
                                      "created": 1700000000, "owned_by": "qwen"})
                 else:
@@ -623,14 +640,23 @@ class QwenHandler(BaseHTTPRequestHandler):
                                      file_info=file_info)
 
         stop_ping = gone = None
+        streamed_reasoning = []
         if stream:
             stop_ping, gone, _hb = self._start_sse()
             self._sse_chunk(cid, echo, {"role": "assistant", "content": ""},
                             None, include_usage)
+
+        def on_reasoning_delta(delta):
+            if stream and delta:
+                streamed_reasoning.append(delta)
+                self._sse_chunk(cid, echo, {"reasoning_content": delta},
+                                None, include_usage)
+
         try:
             text, reasoning, calls, usage = self._run_turn(
                 prompt, upstream, think, tools_active, allowed, schemas,
-                required_params, required_tool, gone, file_info=file_info)
+                required_params, required_tool, gone, file_info=file_info,
+                on_reasoning_delta=on_reasoning_delta if stream else None)
         except Exception as e:
             if stream:
                 try:
@@ -669,7 +695,13 @@ class QwenHandler(BaseHTTPRequestHandler):
         finish = "tool_calls" if calls else ("length" if truncated else "stop")
         if stream:
             try:
-                if reasoning:
+                streamed_len = sum(len(x) for x in streamed_reasoning)
+                if reasoning and len(reasoning) > streamed_len:
+                    extra = reasoning[streamed_len:]
+                    if extra:
+                        self._sse_chunk(cid, echo, {"reasoning_content": extra},
+                                        None, include_usage)
+                elif reasoning and not streamed_reasoning:
                     self._sse_chunk(cid, echo, {"reasoning_content": reasoning},
                                     None, include_usage)
                 if text:
@@ -700,7 +732,7 @@ class QwenHandler(BaseHTTPRequestHandler):
                         None, include_usage)
         full, finish, buf = "", "stop", ""
         hold = max((len(s) for s in stops), default=0)
-        gen = generate_stream(prompt, upstream, think, file_info=file_info)
+        gen = bridge.generate_stream(prompt, upstream, think, file_info=file_info)
         try:
             for kind, delta in gen:
                 if kind == "reasoning":
@@ -834,10 +866,16 @@ class QwenHandler(BaseHTTPRequestHandler):
             stop_ping, gone, _hb = self._start_sse()
             emit("response.created", response=resp_obj("in_progress", [], None))
             emit("response.in_progress", response=resp_obj("in_progress", [], None))
+
+        def on_resp_reasoning(delta):
+            if stream and delta:
+                emit("response.reasoning_text.delta", delta=delta)
+
         try:
             text, _reasoning, calls, usage = self._run_turn(
                 prompt, upstream, think, tools_active, allowed, schemas,
-                required_params, required_tool, gone, file_info=file_info)
+                required_params, required_tool, gone, file_info=file_info,
+                on_reasoning_delta=on_resp_reasoning if stream else None)
         except Exception as e:
             if stream:
                 try:

@@ -4,9 +4,11 @@ Ly do: endpoint completions duoc bao ve boi baxia. Header bx-ua do JS cua
 trang ky cho TUNG request, x5sec het han nhanh -- Python khong tai tao duoc.
 Chay fetch() trong trang dung session that + header anti-bot that.
 
-  * OpenAI API van o CONFIG["port"] (8082) -- server.py khong doi.
+  * OpenAI API van o CONFIG["port"] (8082) -- server.py import truc tiep
+    generate/generate_stream tu module nay.
   * Module nay chay HTTP server thu hai o CONFIG["bridge_port"] (8083).
-  * install() thay qwen.generate_stream/generate bang ban bridge.
+  * /requeue tra job ve hang doi khi extension phai navigate doi che do
+    (temporary chat); /poll nhan them danh sach model de /v1/models merge.
 """
 import json
 import queue
@@ -25,6 +27,7 @@ _ALLOWED_ORIGIN = "https://chat.qwen.ai"
 _lock = threading.Lock()
 _pending = queue.Queue()
 _jobs = {}
+_models = []
 _last_seen = 0.0
 
 
@@ -36,10 +39,50 @@ def worker_alive():
     return (time.time() - _last_seen) < float(CONFIG.get("bridge_worker_ttl", 20))
 
 
+def temporary_chat_enabled():
+    """Doc ca hai kieu key; `temporary_chat` duoc uu tien khi bat."""
+    if CONFIG.get("temporary_chat"):
+        return True
+    return bool(CONFIG.get("temporary-chat"))
+
+
+def known_models():
+    """Ban sao danh sach model do extension bao ve (id + name)."""
+    with _lock:
+        return [dict(m) for m in _models]
+
+
+def _remember_models(items):
+    """Cap nhat danh sach model tu /poll; bo qua entry sai, giu toi da 200."""
+    global _models
+    clean = []
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        mid = item.get("id")
+        if not isinstance(mid, str) or not mid.strip():
+            continue
+        mid = mid.strip()
+        name = item.get("name")
+        if not isinstance(name, str) or not name.strip():
+            name = mid
+        clean.append({"id": mid, "name": name.strip()})
+        if len(clean) >= 200:
+            break
+    if clean:
+        with _lock:
+            _models = clean
+
+
 def status():
     with _lock:
         n = len(_jobs)
+        n_models = len(_models)
     return {"worker": worker_alive(), "pending": _pending.qsize(), "jobs": n,
+            "temporary_chat": temporary_chat_enabled(),
+            "select_model": bool(CONFIG.get("bridge_select_model", True)),
+            "attachment_prompt": str(CONFIG.get("attachment_prompt", "Please read the text and action")),
+            "models": n_models,
             "last_seen_ago": round(time.time() - _last_seen, 1)
             if _last_seen else None}
 
@@ -72,7 +115,7 @@ class _Tracker:
 
 
 def generate_stream(prompt, model, think, usage_out=None, file_info=None):
-    """Yield (kind, text) -- cung interface voi qwen.generate_stream.
+    """Yield (kind, text) -- interface server.py goi cho luong SSE.
 
     file_info (dict, optional): thông tin file tạm chứa prompt quá dài,
     bridge.js sẽ upload file này qua UI trước khi gửi message ngắn.
@@ -93,7 +136,8 @@ def generate_stream(prompt, model, think, usage_out=None, file_info=None):
             _jobs[jid] = q
         _pending.put({"job_id": jid, "model": model, "prompt": prompt,
                       "think": bool(think), "ts": time.time(),
-                      "file_info": file_info})
+                      "file_info": file_info,
+                      "attachment_prompt": str(CONFIG.get("attachment_prompt", "Please read the text and action"))})
         tracker = _Tracker()
         emitted = False
         try:
@@ -139,6 +183,10 @@ def generate_stream(prompt, model, think, usage_out=None, file_info=None):
                 elif kind == "usage":
                     if usage_out is not None and isinstance(ev.get("usage"), dict):
                         usage_out.update(ev["usage"])
+                elif kind == "warn":
+                    # Extension khong lam duoc thu gi do (model picker...) nhung
+                    # request van chay tiep; chi ghi log de debug.
+                    _log("extension warn: " + str(ev.get("message") or ""))
                 elif kind == "error":
                     raise qwen.QwenError(
                         "browser bridge: " + str(ev.get("message") or "unknown"),
@@ -258,6 +306,20 @@ class _Handler(BaseHTTPRequestHandler):
             return self._json({"error": "invalid JSON"}, 400)
         _last_seen = time.time()
 
+        if isinstance(data.get("models"), list):
+            _remember_models(data["models"])
+
+        if path == "/requeue":
+            job = data.get("job")
+            if not isinstance(job, dict) or not isinstance(job.get("job_id"), str) \
+                    or not job["job_id"].strip():
+                return self._json({"error": "invalid job"}, 400)
+            job = dict(job)
+            job["ts"] = time.time()
+            _pending.put(job)
+            _log(f"requeued job {job['job_id']}")
+            return self._json({"ok": True})
+
         if path == "/poll":
             deadline = time.time() + float(CONFIG.get("bridge_poll_wait", 20))
             ttl = float(CONFIG.get("bridge_job_timeout", 300))
@@ -293,13 +355,3 @@ def start_server():
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     _log(f"listening on http://127.0.0.1:{port}")
     return srv
-
-
-def install():
-    """Thay ca ten trong qwen LAN trong server (server import truc tiep)."""
-    from . import server as _server
-    qwen.generate_stream = generate_stream
-    qwen.generate = generate
-    _server.generate_stream = generate_stream
-    _server.generate = generate
-    _log("installed: upstream calls now run inside the browser tab")
