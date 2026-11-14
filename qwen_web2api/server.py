@@ -26,6 +26,7 @@ ERR_API = "api_error"
 ERR_RATE = "rate_limit_error"
 SSE_PING_INTERVAL = 5
 MAX_PROMPT_CHARS = 130000  # buffer an toàn dưới giới hạn 131072 ký tự của Qwen Web
+_MSG_PREVIEW_CHARS = 200   # Option B: số ký tự preview mỗi message trong log
 
 
 def _usage(prompt, text, upstream=None):
@@ -88,6 +89,81 @@ def _cleanup_old_temp_files(max_age_sec=3600):
                 pass
     except Exception as e:
         log(f"[bridge] temp cleanup error: {e}")
+
+
+def _preview(text, limit=None):
+    """Cắt text về limit ký tự, thêm '…' nếu dài hơn."""
+    limit = limit or _MSG_PREVIEW_CHARS
+    if not text:
+        return ""
+    text = text.replace("\n", " ").replace("\r", "")
+    return text[:limit] + ("…" if len(text) > limit else "")
+
+
+def _msg_text(content):
+    """Lay text thuan tu content field (str hoac list of parts)."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for c in content:
+            if isinstance(c, dict):
+                if isinstance(c.get("text"), str):
+                    parts.append(c["text"])
+            elif isinstance(c, str):
+                parts.append(c)
+        return " ".join(p for p in parts if p)
+    return str(content)
+
+
+def _log_messages(cid, messages, tools=None):
+    """Option B: log từng message với role + preview content.
+    Chỉ ghi khi log_requests bật; preview bị truncate để không làm _recent_log
+    overflow chỉ vì 1 request dài."""
+    n = len(messages)
+    tool_names_str = ""
+    if tools:
+        names = [((t.get("function") or t).get("name") or "?") for t in tools if isinstance(t, dict)]
+        tool_names_str = f"  tools=[{', '.join(names)}]" if names else ""
+    log(f"[req] {cid} — {n} message(s){tool_names_str}")
+    for i, m in enumerate(messages):
+        if not isinstance(m, dict):
+            continue
+        role = m.get("role", "?")
+        # tool_calls: liệt kê tên hàm thay vì dump full JSON
+        if role == "assistant" and m.get("tool_calls"):
+            tc_names = [c.get("function", {}).get("name", "?")
+                        for c in m["tool_calls"] if isinstance(c, dict)]
+            log(f"[req] {cid}  [{i}] {role}: <tool_calls: {', '.join(tc_names)}>")
+            continue
+        # tool result
+        if role == "tool":
+            content_str = _msg_text(m.get("content"))
+            log(f"[req] {cid}  [{i}] tool(id={m.get('tool_call_id', '?')}): "
+                f"{_preview(content_str)}")
+            continue
+        content_str = _msg_text(m.get("content"))
+        log(f"[req] {cid}  [{i}] {role}({len(content_str)}c): {_preview(content_str)}")
+
+
+def _log_turn_result(cid, text, reasoning, calls, usage, elapsed):
+    """Option B: log kết quả sau mỗi turn — text preview, reasoning, tool calls, usage, timing."""
+    parts = []
+    if reasoning:
+        parts.append(f"reasoning={len(reasoning)}c")
+    if text:
+        parts.append(f"text={len(text)}c: {_preview(text)}")
+    if calls:
+        tc_names = [c.get("function", {}).get("name", "?") for c in calls if isinstance(c, dict)]
+        parts.append(f"tool_calls=[{', '.join(tc_names)}]")
+    if usage:
+        p = usage.get("prompt_tokens", usage.get("input_tokens", "?"))
+        c = usage.get("completion_tokens", usage.get("output_tokens", "?"))
+        parts.append(f"usage=({p}+{c}tok)")
+    parts.append(f"elapsed={elapsed:.1f}s")
+    log(f"[res] {cid} — {' | '.join(parts)}")
 
 
 def prepare_large_prompt(messages, tools=None, tool_choice=None):
@@ -493,6 +569,7 @@ class QwenHandler(BaseHTTPRequestHandler):
                 break
             call_prompt = prompt + nudge if nudge else prompt
             debug_log(f"run_turn attempt {attempt + 1}/{attempts} (tools_active={tools_active}, required_tool={bool(required_tool)})")
+            _t0 = time.time()
             if on_reasoning_delta:
                 content_parts = []
                 reasoning_parts = []
@@ -512,8 +589,16 @@ class QwenHandler(BaseHTTPRequestHandler):
                 result = bridge.generate(call_prompt, upstream, think, file_info=file_info)
                 text, reasoning, usage = (result["content"], result["reasoning"],
                                           result["usage"])
+            _elapsed = time.time() - _t0
+            debug_log(f"run_turn elapsed={_elapsed:.1f}s text={len(text)}c reasoning={len(reasoning)}c")
             calls = None
             if tools_active and text:
+                # Log raw fence trước khi parse để debug parse lỗi
+                import re as _re
+                _fences = _re.findall(r"```tool_call\b.*?```", text, _re.DOTALL)
+                if _fences:
+                    debug_log(f"raw tool fence(s) ({len(_fences)}):\n" +
+                              "\n---\n".join(f[:400] for f in _fences))
                 text, calls, _dropped = parse_tool_calls(text, allowed, schemas)
             if calls:
                 debug_log(f"parsed {len(calls)} tool call(s): {[c['function']['name'] for c in calls]}")
@@ -667,6 +752,7 @@ class QwenHandler(BaseHTTPRequestHandler):
         max_tokens = req.get("max_tokens") or req.get("max_completion_tokens")
         include_usage = bool((req.get("stream_options") or {}).get("include_usage"))
         cid = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+        _log_messages(cid, req.get("messages", []), req.get("tools"))  # Option B: log messages gốc (trước khi split)
         tools_active = bool(tools) and tool_choice != "none"
         required_tool = is_required_tool_choice(tool_choice)
         allowed = tool_names(tools) or None
@@ -691,6 +777,7 @@ class QwenHandler(BaseHTTPRequestHandler):
                 self._sse_chunk(cid, echo, {"reasoning_content": delta},
                                 None, include_usage)
 
+        _t_start = time.time()
         try:
             text, reasoning, calls, usage = self._run_turn(
                 prompt, upstream, think, tools_active, allowed, schemas,
@@ -713,6 +800,7 @@ class QwenHandler(BaseHTTPRequestHandler):
                 stop_ping()
             _remove_prompt_file(file_info)
 
+        _log_turn_result(cid, text, reasoning, calls, usage, time.time() - _t_start)
         if rf and text:
             text = strip_code_fence(text)
         text = _apply_stop(text, stops)
@@ -772,10 +860,13 @@ class QwenHandler(BaseHTTPRequestHandler):
         full, finish, buf = "", "stop", ""
         hold = max((len(s) for s in stops), default=0)
         gen = bridge.generate_stream(prompt, upstream, think, file_info=file_info)
+        _t_start = time.time()
+        full_reasoning = []
         try:
             for kind, delta in gen:
                 if kind == "reasoning":
                     if delta:
+                        full_reasoning.append(delta)
                         self._sse_chunk(cid, model,
                                         {"reasoning_content": delta},
                                         None, include_usage)
@@ -841,6 +932,7 @@ class QwenHandler(BaseHTTPRequestHandler):
         if include_usage:
             self._sse_usage(cid, model, prompt, full, None)
         self._sse_done()
+        _log_turn_result(cid, full, "".join(full_reasoning), None, {}, time.time() - _t_start)
 
     # ---------------------------------------------------------- responses --
     def _handle_responses(self, body):
@@ -878,6 +970,7 @@ class QwenHandler(BaseHTTPRequestHandler):
         stream = bool(req.get("stream"))
         debug_log(f"responses request: model={echo}, input_items={len(req.get('input', []))}, stream={stream}, tools={len(tools) if tools else 0}")
         rid = f"resp_{uuid.uuid4().hex[:16]}"
+        _log_messages(rid, messages, tools)  # Option B: log messages (sau _responses_messages normalize)
         created = int(time.time())
         seq = 0
 
@@ -913,6 +1006,7 @@ class QwenHandler(BaseHTTPRequestHandler):
             if stream and delta:
                 emit("response.reasoning_text.delta", delta=delta)
 
+        _t_start = time.time()
         try:
             text, _reasoning, calls, usage = self._run_turn(
                 prompt, upstream, think, tools_active, allowed, schemas,
@@ -936,6 +1030,7 @@ class QwenHandler(BaseHTTPRequestHandler):
                 stop_ping()
             _remove_prompt_file(file_info)
 
+        _log_turn_result(rid, text, _reasoning, calls, usage, time.time() - _t_start)
         if rfi and text:
             text = strip_code_fence(text)
         text, truncated = _apply_max_tokens(text, req.get("max_output_tokens"))
