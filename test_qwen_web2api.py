@@ -771,6 +771,29 @@ class TestBridgeCore(_Sandbox):
                 list(bridge.generate_stream("plain chat", "m", False))
         self.assertEqual(ctx.exception.status, 502)
 
+    def test_tab_reloaded_warn_fails_fast(self):
+        pending = _fake_pending([
+            {"kind": "warn", "tab_reloaded": True, "stage": "file_uploaded",
+             "message": "tab reloaded"},
+        ])
+        with mock.patch.object(bridge, "worker_alive", return_value=True), \
+                mock.patch.object(bridge, "_pending", pending):
+            with self.assertRaises(qwen.QwenError) as ctx:
+                list(bridge.generate_stream("hi", "m", False))
+        self.assertEqual(ctx.exception.status, 502)
+        self.assertIn("file_uploaded", str(ctx.exception))
+
+    def test_tab_reloading_beacon_does_not_fail_job(self):
+        pending = _fake_pending([
+            {"kind": "warn", "tab_reloading": True, "message": "unload"},
+            {"kind": "delta", "text": "ok"},
+            {"kind": "done"},
+        ])
+        with mock.patch.object(bridge, "worker_alive", return_value=True), \
+                mock.patch.object(bridge, "_pending", pending):
+            out = list(bridge.generate_stream("hi", "m", False))
+        self.assertEqual(out, [("content", "ok")])
+
     def test_error_event_is_502(self):
         pending = _fake_pending([{"kind": "error", "message": "boom"}])
         with mock.patch.object(bridge, "worker_alive", return_value=True), \

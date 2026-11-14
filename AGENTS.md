@@ -132,6 +132,16 @@ Luồng chat: `do_POST` → `_handle_chat` / `_handle_responses` →
    byte; CRLF được chuẩn hoá về LF (Windows text mode từng ghi `\r\r\n` làm phình file). File vượt
    giới hạn thì paste không thành attachment, composer bị thay bằng companion prompt và MẤT lịch sử.
    bridge.js gửi `warn` nếu `file_info.size` > 131072.
+   - **Job sau bị đứng ở temporary chat**: `runJob` gọi `waitUiIdle` trước mỗi job — nếu Qwen UI vẫn đang generate
+     (nút Stop; job trước settle sớm do native `tool_call`/`role=function`) thì bridge bấm Stop rồi mới gõ prompt mới.
+     `submitPrompt` dùng vòng lặp `sendPrompt` (chờ nút Send, thử Enter, không click lại khi `job.attached`);
+     `findSendButton` bỏ qua nút Stop.
+   - **Prompt lớn không thành attachment**: `attachLongPrompt` thử lần lượt paste-text → paste-file → `input[type=file]`
+     → drop-file, mỗi bước kiểm tra card; cả bốn thất bại và text thô > 125000 ký tự thì ném lỗi (Python retry)
+     thay vì gửi text vượt giới hạn. Job có file dùng `SEND_TIMEOUT_FILE_MS` (240s).
+   - **tab_reloaded**: Python `generate_stream` fail nhanh (502 → retry) khi extension báo `tab_reloaded`;
+     `tab_reloading` (beforeunload) vẫn chỉ là cảnh báo.
+   - `findModelTrigger` không còn chọn nhầm nút profile ("QwenUser… Free").
 
 ## Kiểm tra UI thủ công
 

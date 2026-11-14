@@ -250,6 +250,7 @@
       }
     } catch (e) {
       log("model refresh skipped:", (e && e.message) || e);
+      lastModelRefresh = Date.now() - MODEL_REFRESH_MS + 60000;  // thu lai sau 1 phut, khong moi vong poll
       // Forward warn về Python nếu có job đang chạy, rate-limited 60s
       const now = Date.now();
       if (now - lastModelRefreshWarnTs > 60000) {
@@ -286,10 +287,19 @@
   }
 
   function findModelTrigger(targets) {
+    /* qwen_fix_patch:model-trigger */
     const nodes = Array.from(document.querySelectorAll(
       'button, [role="button"], [role="combobox"], [aria-haspopup], [class*="model" i]'
     ));
     const norms = (targets || []).map(normLabel).filter(Boolean);
+    const known = [];
+    for (const m of knownModels) {
+      if (!m) continue;
+      for (const v of [m.id, m.name]) {
+        const n = normLabel(v);
+        if (n) known.push(n);
+      }
+    }
     let best = null, bestScore = 0;
     for (const el of nodes) {
       if (!visible(el)) continue;
@@ -298,14 +308,17 @@
       const low = label.toLowerCase();
       if (/^(send|stop|gửi|dừng)/i.test(low)) continue;
       const n = normLabel(label);
+      if (!n) continue;
       let score = 0;
       if (norms.includes(n)) score += 5;
       else if (norms.some((t) => t && n.includes(t)
         && Math.abs(n.length - t.length) <= 3)) score += 3;
+      else if (known.includes(n)) score += 4;          // dang hien 1 model khac trong danh sach
+      // "Qwen3.8-Max" hop le; "QwenUser6364 Free" (nut profile) thi khong.
+      else if (/^(qwen|qwq)\d/.test(n) && n.length <= 40) score += 4;
       const hint = ((el.getAttribute("aria-label") || "") + " "
         + (el.getAttribute("title") || "")).toLowerCase();
       if (/model|mô hình/.test(hint)) score += 2;
-      if (/^(qwen|qwq)/.test(n)) score += 2;
       if (el.closest("form")) score -= 2;
       if (el.matches('button, [role="button"], [role="combobox"], [aria-haspopup]')) score += 1;
       if (score > bestScore) { best = el; bestScore = score; }
@@ -955,6 +968,7 @@
   }
 
   function findSendButton(composer) {
+    /* qwen_fix_patch:send-button */
     const scope = composer.closest("form") || document;
     const nodes = Array.from(scope.querySelectorAll('button, [role="button"]'));
     const rx = /send|gửi|gui|submit|arrow/i;
@@ -962,10 +976,10 @@
     for (const el of nodes) {
       if (!visible(el)) continue;
       if (el.disabled || el.getAttribute("aria-disabled") === "true") continue;
+      if (isStopButton(el)) continue;   // dang generate: nut Stop khong phai Send
       const label = (el.getAttribute("aria-label") || el.getAttribute("title")
         || el.getAttribute("data-testid") || el.textContent || "").toLowerCase();
       let score = 0;
-      if (/stop|cancel|abort|dừng/.test(label)) continue;  // khong bam nham nut Stop
       if (el.type === "submit") score += 3;
       if (rx.test(label)) score += 3;
       if (el.querySelector("svg")) score += 1;
@@ -982,10 +996,11 @@
   }
 
   async function submitPrompt(composer, prompt, job) {
+    /* qwen_fix_patch:submit */
     saveJobState(job, "typing_prompt", "Setting prompt text");
     setComposer(composer, prompt);
     await sleep(350);
-    // Neu UI tu dong chuyen text vua paste/nhap thanh attachment card va lam rong composer:
+    // UI tu doi text dai vua nhap thanh attachment card va lam rong composer:
     if (!composerText(composer).trim()) {
       const companion = attachmentPrompt || ATTACHMENT_COMPANION_PROMPT;
       log("composer empty after setting prompt; inserting companion prompt:", companion);
@@ -997,16 +1012,14 @@
         if (job) send(job.id, { kind: "warn", message: warnMsg });
       }
     }
-    saveJobState(job, "submitting", "Clicking send button");
-    const btn = findSendButton(composer);
-    if (btn) {
-      btn.click();
-      return;
+    saveJobState(job, "submitting", "Waiting for send button");
+    // Truoc day chi thu 1 lan sau 350ms: neu Send chua enable (UI con render hoac
+    // dang generate) thi prompt dung luon trong composer. Dung vong lap co retry.
+    const sent = await sendPrompt(composer, 60000, null, job);
+    if (!sent && job && !job.settled && !job.attached) {
+      send(job.id, { kind: "warn",
+        message: "khong xac nhan duoc da bam Send (nut Send khong san sang)" });
     }
-    pressEnter(composer);
-    await sleep(500);
-    const btn2 = findSendButton(composer);
-    if (btn2) btn2.click();
   }
 
   function composerText(el) {
@@ -1163,54 +1176,61 @@
   // Prompt quá dài: paste để Qwen tự tạo document txt; nếu UI bỏ qua paste thì
   // thử upload file, cuối cùng mới gửi nguyên text.
   async function attachLongPrompt(composer, fileInfo, companionPrompt, job) {
+    /* qwen_fix_patch:attach-long */
     const promptText = companionPrompt || attachmentPrompt || ATTACHMENT_COMPANION_PROMPT;
+    const RAW_FALLBACK_MAX = 125000;   // Qwen gioi han ~131072 ky tu / message
     const text = await fetchPromptText(fileInfo);
-    if (job && fileInfo.size > 131072) {
-      send(job.id, { kind: "warn",
-        message: "file prompt " + fileInfo.size + " ky tu > 131072: Qwen se KHONG chuyen "
-          + "paste thanh file dinh kem (lich su se mat)" });
-    }
+    const fname = fileInfo.filename || "";
     const before = attachmentSnapshot();
+    const baseCount = findActiveAttachmentElements(composer).length;
 
-    saveJobState(job, "pasting_file", "Pasting file: " + fileInfo.filename);
-    await pasteLongText(composer, text);
-    const pastedLen = composerText(composer).trim().length;
-    log("large prompt pasted:", pastedLen, "chars in composer");
+    // Moi cach deu duoc kiem tra card; that bai thi xoa composer roi thu cach tiep.
+    const strategies = [
+      { name: "paste-text", wait: 15000, run: async () => {
+          await pasteLongText(composer, text);
+          return composerText(composer).trim().length;
+      } },
+      { name: "paste-file", wait: 12000, run: async () => {
+          pasteFileEvent(composer, fileInfo, text);
+          await sleep(1500);
+          return 0;
+      } },
+      { name: "file-input", wait: 15000, run: async () => {
+          await uploadFileViaUI(fileInfo, text, job);
+          return 0;
+      } },
+      { name: "drop-file", wait: 12000, run: async () => {
+          dropFileEvent(composer, fileInfo, text);
+          await sleep(1500);
+          return 0;
+      } },
+    ];
 
-    let attached;
-    if (pastedLen > 500) {
-      // Paste đã chèn text: chờ Qwen chuyển thành document (có thể mất vài giây).
-      attached = await waitForAttachment(composer, before, pastedLen, 20000);
-    } else {
-      // Không thấy text: hoặc Qwen đã chuyển ngay thành attachment, hoặc paste
-      // bị bỏ qua. Chờ attachment ngắn, rồi thử upload file.
-      attached = await waitForAttachment(composer, before, 0, 2500);
-      if (!attached) {
-        saveJobState(job, "uploading_file", "Uploading file via UI fallback: " + fileInfo.filename);
-        attached = await uploadFileViaUI(fileInfo, text, job);
-        if (attached) {
-          attached = await waitForAttachment(composer, before, 0, 15000);
-        }
-      }    }
+    let attached = false, used = "";
+    for (const s of strategies) {
+      if (job && job.settled) return;
+      saveJobState(job, "attach_" + s.name, "Attaching " + fname + " via " + s.name);
+      let pastedLen = 0;
+      try {
+        pastedLen = await s.run();
+      } catch (e) {
+        log("attach strategy " + s.name + " error:", (e && e.message) || e);
+      }
+      log("large prompt via " + s.name + ": composer=" + pastedLen + " chars");
+      attached = await waitForAttachmentEx(composer, before, baseCount, pastedLen, fname, s.wait);
+      if (attached) { used = s.name; break; }
+      if (job) send(job.id, { kind: "warn",
+        message: "attach '" + s.name + "' khong tao duoc attachment card; thu cach khac" });
+      clearComposer(composer);
+      await sleep(400);
+    }
 
     if (attached) {
-      saveJobState(job, "file_uploaded", "File attached in DOM: " + fileInfo.filename);
-      // Kiem tra xac thuc thuc su co card/chip attachment trong DOM
-      const activeAtts = findActiveAttachmentElements(composer);
-      if (!activeAtts.length) {
-        const warnMsg = "CANH BAO: Co attachment_prompt nhung thieu pasted file trong DOM (khong tim thay card/chip file sau khi paste/upload)!";
-        log(warnMsg);
-        if (job) send(job.id, { kind: "warn", message: warnMsg });
-      } else {
-        debugLog("Pasted file confirmed attached in DOM (" + activeAtts.length + " element(s))");
-        if (job) send(job.id, { kind: "debug", message: "Pasted file confirmed attached in DOM (" + activeAtts.length + " items)" });
-      }
-
+      saveJobState(job, "file_uploaded", "File attached via " + used + ": " + fname);
+      if (job) send(job.id, { kind: "debug", message: "large prompt attached via " + used });
       await sleep(800);
       setComposerClean(composer, promptText);
       await sleep(300);
-
-      // Kiem tra xem attachment_prompt da thuc su duoc paste vao composer chua
       let currentText = composerText(composer).trim();
       if (!currentText) {
         log("attachment_prompt chua xuat hien trong composer, thu set lai lan 2...");
@@ -1224,37 +1244,57 @@
         if (job) send(job.id, { kind: "warn", message: warnMsg });
       } else {
         saveJobState(job, "prompt_inserted", "Attachment prompt inserted: " + currentText.slice(0, 30));
-        debugLog("attachment_prompt pasted successfully (" + currentText.length + " chars):", currentText.slice(0, 60));
-        if (job) send(job.id, { kind: "debug", message: "Attachment prompt pasted: " + currentText.slice(0, 60) });
+        debugLog("attachment_prompt pasted (" + currentText.length + " chars):", currentText.slice(0, 60));
       }
-      log("large prompt attached; set companion prompt:", promptText);
-    } else {
-      // Không tạo được attachment: gửi trực tiếp toàn bộ prompt đã render
-      saveJobState(job, "fallback_raw_text", "Could not attach file, sending raw text");
-      log("khong tao duoc attachment; gui truc tiep text dai");
-      if (job) send(job.id, { kind: "warn", message: "Khong tao duoc attachment card; gui truc tiep text dai" });
-      const fullText = (promptText && promptText !== ATTACHMENT_COMPANION_PROMPT && promptText !== attachmentPrompt)
-        ? text + "\n\n" + promptText
-        : text;
-      setComposer(composer, fullText);
+      await sleep(400);
+      return;
     }
+
+    // Khong cach nao tao duoc attachment.
+    const extra = (promptText && promptText !== ATTACHMENT_COMPANION_PROMPT
+      && promptText !== attachmentPrompt) ? promptText : "";
+    const fullText = extra ? text + "\n\n" + extra : text;
+    if (fullText.length > RAW_FALLBACK_MAX) {
+      // Gui text tho vuot gioi han -> Send bi khoa, tab treo den het timeout.
+      // Bao loi ngay de Python retry.
+      throw new Error("khong dinh kem duoc prompt dai (" + fullText.length
+        + " ky tu) bang paste/upload/drop; text tho vuot " + RAW_FALLBACK_MAX);
+    }
+    saveJobState(job, "fallback_raw_text", "Could not attach file, sending raw text");
+    log("khong tao duoc attachment; gui truc tiep text dai (" + fullText.length + ")");
+    if (job) send(job.id, { kind: "warn", message: "Khong tao duoc attachment card; gui truc tiep text dai" });
+    setComposerClean(composer, fullText);
     await sleep(400);
   }
 
   // Chờ send button sẵn sàng (thường là sau khi upload xong) rồi bấm.
   // Nếu UI chưa nhận, thử lại vài lần.
   async function sendPrompt(composer, timeoutMs = 45000, fallbackPrompt = null, job = null) {
+    /* qwen_fix_patch:send-loop */
     const companion = fallbackPrompt || attachmentPrompt || ATTACHMENT_COMPANION_PROMPT;
+    if (job && job.file_info) timeoutMs = Math.max(timeoutMs, 90000);  // doi upload xong
     const deadline = Date.now() + timeoutMs;
-    let clicks = 0;
+    let clicks = 0, enters = 0, noBtnSince = 0, lastEnter = 0;
     while (Date.now() < deadline) {
+      if (job && (job.attached || job.settled)) return !!job.attached;
       const btn = findSendButton(composer);
       if (!btn) {
+        // Khong co nut Send: UI dang generate/upload. Neu UI da ranh ma van khong
+        // thay nut (doi layout) thi thu Enter, toi da 3 lan.
+        if (!noBtnSince) noBtnSince = Date.now();
+        if (Date.now() - noBtnSince > 4000 && Date.now() - lastEnter > 4000
+            && enters < 3 && !findStopButton() && composerText(composer).trim()) {
+          enters++;
+          lastEnter = Date.now();
+          log("khong thay nut Send; thu Enter (" + enters + ")");
+          pressEnter(composer);
+        }
         await sleep(400);
         continue;
       }
+      noBtnSince = 0;
 
-      // Kiem tra thieu paste attachment_prompt
+      // Composer rong truoc khi gui: chen companion prompt (tranh loi "content is empty")
       if (!composerText(composer).trim()) {
         log("composer is empty before sending; inserting companion prompt:", companion);
         setComposerClean(composer, companion);
@@ -1266,17 +1306,15 @@
         }
       }
 
-      // Kiem tra co attachment_prompt nhung thieu pasted file. Heuristic DOM nay
-      // bao sai (log that: 12-17 canh bao/job du model van doc duoc file) nen chi
-      // canh bao 1 lan/job; bang chung chinh xac la dong 'completion request: ...'
-      // do inspectCompletionRequest gui ve.
-      if (job && job.file_info && !job._warnedNoAttach) {
-        const hasAtt = findActiveAttachmentElements(composer).length > 0;
-        const hasTxt = !!composerText(composer).trim();
-        if (hasTxt && !hasAtt) {
-          job._warnedNoAttach = true;
-          const warnMsg = "CANH BAO: khong thay attachment card trong DOM truoc khi bam gui "
-            + "(heuristic, co the sai - xem dong 'completion request' de biet file co duoc gui that)";
+      // Job prompt lon: canh bao neu khong thay card (heuristic, chi de chan doan)
+      if (job && job.file_info && !job._warnedNoAtt) {
+        const fname = job.file_info.filename || "";
+        const scope = composer.closest("form") || document.body;
+        const hasAtt = findActiveAttachmentElements(composer).length > 0
+          || (fname && String((scope && scope.innerText) || "").includes(fname));
+        if (composerText(composer).trim() && !hasAtt) {
+          job._warnedNoAtt = true;
+          const warnMsg = "CANH BAO: khong thay attachment card trong DOM truoc khi bam gui (heuristic, co the sai - xem dong 'completion request' de biet file co duoc gui that)";
           log(warnMsg);
           send(job.id, { kind: "warn", message: warnMsg });
         }
@@ -1288,20 +1326,141 @@
       clicks++;
       log("send click", clicks);
       await sleep(1500);
+      if (job && job.attached) return true;      // da bat duoc completion: dung click them
       if (!findSendButton(composer)) return true;
       if (hadText && !composerText(composer).trim()) return true;
       if (clicks >= 15) break;
     }
-    pressEnter(composer);
+    return !!(job && job.attached);
+  }
+
+  /* qwen_fix_patch:ui-idle */
+  const SEND_TIMEOUT_FILE_MS = 240000;  // job co file lon: paste/upload mat nhieu thoi gian
+  const STOP_LABEL_RX = /\b(stop|interrupt)\b|dừng|ngừng|停止|终止/i;
+  const STOP_CLASS_RX = /(^|[\s_-])stop([\s_-]|$)/i;
+
+  function isStopButton(el) {
+    if (!el || typeof el.getAttribute !== "function") return false;
+    const label = [el.getAttribute("aria-label"), el.getAttribute("title"),
+      el.getAttribute("data-testid"), el.getAttribute("data-icon")]
+      .filter(Boolean).join(" ");
+    if (STOP_LABEL_RX.test(label)) return true;
+    const cls = typeof el.className === "string" ? el.className : "";
+    if (STOP_CLASS_RX.test(cls)) return true;
+    return !!(el.querySelector && el.querySelector('[class*="stop" i], [data-icon*="stop" i]'));
+  }
+
+  function findStopButton() {
+    const nodes = Array.from(document.querySelectorAll('button, [role="button"]'));
+    for (const el of nodes) {
+      if (!visible(el)) continue;
+      if (el.disabled || el.getAttribute("aria-disabled") === "true") continue;
+      if (isStopButton(el)) return el;
+    }
+    return null;
+  }
+
+  // Qwen co the van generate sau khi job truoc da settle (vd. native tool_call
+  // da tra ve client roi Qwen tu chay tiep). Neu go prompt moi luc do, nut Send
+  // bi thay bang Stop va prompt dung yen trong composer. Cho UI ranh, hoac bam
+  // Stop (ket qua job truoc da lay xong) roi moi bat dau job moi.
+  async function waitUiIdle(job) {
+    const t0 = Date.now();
+    let clicks = 0, stopSeenAt = 0;
+    while (Date.now() - t0 < 12000) {
+      const stop = findStopButton();
+      if (!stop) {
+        if (stopSeenAt) debugLog("waitUiIdle: UI idle sau " + (Date.now() - t0) + "ms");
+        return true;
+      }
+      if (!stopSeenAt) stopSeenAt = Date.now();
+      if (Date.now() - stopSeenAt > 1500 && clicks < 2) {
+        clicks++;
+        log("UI van dang generate sau job truoc; bam Stop (" + clicks + ")");
+        if (job) send(job.id, { kind: "debug",
+          message: "UI dang generate khi nhan job moi; bam Stop de giai phong composer" });
+        stop.click();
+        await sleep(800);
+        continue;
+      }
+      await sleep(300);
+    }
+    if (job) send(job.id, { kind: "warn",
+      message: "UI van o trang thai generating sau 12s; van tiep tuc gui" });
     return false;
   }
 
+  // --- attach prompt lon: phat hien card + cac cach dua file vao UI ---
+  function attachmentDetected(composer, before, baseCount, pastedLen, fname) {
+    try {
+      if (Array.from(attachmentSnapshot()).some((n) => !before.has(n))) return true;
+      if (findActiveAttachmentElements(composer).length > baseCount) return true;
+      if (pastedLen > 500) {
+        const now = composerText(composer).trim().length;
+        if (now < Math.max(200, pastedLen / 2)) return true;
+      }
+      if (fname) {
+        const scope = composer.closest("form") || document.body;
+        if (String((scope && scope.innerText) || "").includes(fname)) return true;
+      }
+    } catch (e) { /* heuristic */ }
+    return false;
+  }
+
+  async function waitForAttachmentEx(composer, before, baseCount, pastedLen, fname, timeoutMs) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (attachmentDetected(composer, before, baseCount, pastedLen, fname)) return true;
+      await sleep(400);
+    }
+    return false;
+  }
+
+  function makeTextFile(fileInfo, text) {
+    return new File([text], fileInfo.filename, { type: "text/plain" });
+  }
+
+  // Paste mot FILE (clipboardData.files) thay vi text: app xu ly nhu dan file.
+  function pasteFileEvent(composer, fileInfo, text) {
+    composer.focus();
+    try {
+      const dt = new DataTransfer();
+      dt.items.add(makeTextFile(fileInfo, text));
+      composer.dispatchEvent(new ClipboardEvent("paste", {
+        clipboardData: dt, bubbles: true, cancelable: true,
+      }));
+    } catch (e) { log("paste-file failed:", (e && e.message) || e); }
+  }
+
+  // Tha file vao vung chat (dropzone cua Qwen).
+  function dropFileEvent(composer, fileInfo, text) {
+    try {
+      const dt = new DataTransfer();
+      dt.items.add(makeTextFile(fileInfo, text));
+      const target = composer.closest("form") || composer;
+      for (const type of ["dragenter", "dragover", "drop"]) {
+        target.dispatchEvent(new DragEvent(type, {
+          dataTransfer: dt, bubbles: true, cancelable: true,
+        }));
+      }
+    } catch (e) { log("drop-file failed:", (e && e.message) || e); }
+  }
+
   async function runJob(job) {
+    try {
+      await waitUiIdle(job);
+    } catch (e) {
+      log("waitUiIdle error:", (e && e.message) || e);
+    }
+    return runJobInner(job);
+  }
+
+  async function runJobInner(job) {
     current = job;
     saveJobState(job, "started", "Job " + job.id + " started");
     let sendTimer = setTimeout(() => {
       settle(job, new Error("UI send timeout: khong bat duoc completion response"));
-    }, SEND_TIMEOUT_MS);
+    }, job.file_info ? SEND_TIMEOUT_FILE_MS : SEND_TIMEOUT_MS);
     job._clearSendTimer = () => {
       if (sendTimer) {
         clearTimeout(sendTimer);

@@ -208,6 +208,14 @@ def generate_stream(prompt, model, think, usage_out=None, file_info=None):
                     # Extension khong lam duoc thu gi do (model picker...) nhung
                     # request van chay tiep; chi ghi log de debug.
                     _log("extension warn: " + str(ev.get("message") or ""))
+                    if ev.get("tab_reloaded"):
+                        # Tab da reload giua job (file paste/upload mat, completion
+                        # khong bao gio toi): fail nhanh de retry thay vi cho het
+                        # bridge_job_timeout. ("tab_reloading" = beforeunload, khi
+                        # tab tu navigate doi mode: chi la canh bao, KHONG fail.)
+                        raise qwen.QwenError(
+                            "browser bridge: tab reload giua chung job (buoc: "
+                            + str(ev.get("stage") or "?") + ")", status=502)
                 elif kind == "error":
                     raise qwen.QwenError(
                         "browser bridge: " + str(ev.get("message") or "unknown"),
