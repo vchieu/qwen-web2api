@@ -176,6 +176,28 @@ class TestToolsPrompt(_Sandbox):
         self.assertNotIn("# Tool Use", p)
         self.assertNotIn("[Reminder: you have working tools", p)
 
+    def test_tool_block_routes_final_answer_through_completion_tool(self):
+        defs = [{"type": "function",
+                 "function": {"name": "attempt_completion"}}]
+        p = tools.messages_to_prompt([{"role": "user", "content": "go"}], defs)
+        self.assertIn("matching completion tool", p)
+        self.assertIn("attempt_completion", p)
+        plain = tools.messages_to_prompt([{"role": "user", "content": "go"}])
+        self.assertNotIn("matching completion tool", plain)
+
+    def test_crlf_is_normalized_in_prompt(self):
+        p = tools.messages_to_prompt([{"role": "user",
+                                       "content": "a\r\nb\rc"}])
+        self.assertEqual(p, "a\nb\nc")
+
+    def test_max_bytes_override_truncates_prompt(self):
+        msgs = [{"role": "user", "content": f"message-{i:02d}-" + "x" * 40}
+                for i in range(30)]
+        p = tools.messages_to_prompt(msgs, max_bytes=400)
+        self.assertLessEqual(len(p.encode("utf-8")), 400)
+        self.assertIn("message-29-", p)
+        self.assertGreater(len(tools.messages_to_prompt(msgs).encode("utf-8")), 400)
+
     def test_tool_choice_instructions(self):
         base = [{"type": "function", "function": {"name": "f"}}]
         msg = [{"role": "user", "content": "go"}]
@@ -1136,6 +1158,29 @@ class TestServerHelpers(_Sandbox):
             self.assertEqual(short, [{"role": "user", "content": "run tool now"}])
             self.assertIn("# Tool Use", file_info["attachment_prompt"])
             self.assertIn("run tool now", file_info["attachment_prompt"])
+        finally:
+            server._remove_prompt_file(file_info)
+
+    def test_prepare_large_prompt_history_file_fits_paste_limit(self):
+        # Qwen khong chuyen paste > 131072 ky tu thanh file: file lich su phai bi
+        # cat (giu tin moi nhat) de <= FILE_MAX_CHARS.
+        msgs = [{"role": "system", "content": "SYS"}]
+        msgs += [{"role": "user" if i % 2 == 0 else "assistant",
+                  "content": f"m{i:02d}-" + "x" * 300} for i in range(20)]
+        msgs.append({"role": "user", "content": "last question"})
+        with mock.patch.object(server, "MAX_PROMPT_CHARS", 1000), \
+                mock.patch.object(server, "FILE_MAX_CHARS", 2000):
+            file_info, short = server.prepare_large_prompt(msgs)
+        try:
+            self.assertIsNotNone(file_info)
+            with open(file_info["path"], encoding="utf-8") as f:
+                content = f.read()
+            self.assertLessEqual(len(content), 2000)
+            self.assertEqual(file_info["size"], len(content))
+            self.assertIn("[...truncated...]", content)
+            self.assertIn("m19-", content)
+            self.assertEqual(short, [{"role": "user",
+                                      "content": "last question"}])
         finally:
             server._remove_prompt_file(file_info)
 

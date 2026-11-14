@@ -25,6 +25,9 @@ ERR_INVALID = "invalid_request_error"
 ERR_API = "api_error"
 ERR_RATE = "rate_limit_error"
 SSE_PING_INTERVAL = 5
+# File prompt (paste -> document) phai <= 131072 ky tu, neu khong Qwen KHONG chuyen
+# thanh file dinh kem (log that: history file 147719 chars -> mat lich su).
+FILE_MAX_CHARS = 130000
 MAX_PROMPT_CHARS = 130000  # buffer an toàn dưới giới hạn 131072 ký tự của Qwen Web
 _MSG_PREVIEW_CHARS = 200   # Option B: số ký tự preview mỗi message trong log
 
@@ -166,6 +169,28 @@ def _log_turn_result(cid, text, reasoning, calls, usage, elapsed):
     log(f"[res] {cid} — {' | '.join(parts)}")
 
 
+def _render_fit(messages, tools=None, tool_choice=None, prefix="", limit=None):
+    """Render messages -> prompt sao cho len(prefix + prompt) <= limit ky tu.
+
+    Vuot thi cat theo co che cua tools._join_parts (giu dau + tin nhan moi nhat,
+    chen [...truncated...]). Gioi han la KY TU nen suy ra tran byte theo ti le."""
+    limit = limit or FILE_MAX_CHARS
+    budget = max(1000, limit - len(prefix))
+    text = messages_to_prompt(messages, tools, tool_choice, max_bytes=1 << 30)
+    orig = len(text)
+    if orig > budget:
+        max_bytes = int(len(text.encode("utf-8")) * budget / orig * 0.98)
+        for _ in range(8):
+            text = messages_to_prompt(messages, tools, tool_choice,
+                                      max_bytes=max_bytes)
+            if len(text) <= budget:
+                break
+            max_bytes = int(max_bytes * 0.9)
+        log(f"[bridge] file prompt {orig} chars > {limit}: truncated to "
+            f"{len(text)} chars (Qwen khong chuyen paste > 131072 thanh file)")
+    return prefix + text
+
+
 def prepare_large_prompt(messages, tools=None, tool_choice=None):
     """Nếu prompt đã render (gồm cả tool block) vượt MAX_PROMPT_CHARS,
     tách history sang file .txt tạm và giữ tin nhắn user cuối cùng làm prompt.
@@ -191,11 +216,10 @@ def prepare_large_prompt(messages, tools=None, tool_choice=None):
 
     if can_split:
         history = messages[:-1]
-        history_prompt = messages_to_prompt(history)
-        file_content = f"[Conversation History]\n\n{history_prompt}"
+        file_content = _render_fit(history, prefix="[Conversation History]\n\n")
 
         fd, path = tempfile.mkstemp(suffix=".txt", prefix="qwen_prompt_")
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
             f.write(file_content)
 
         file_info = {
@@ -217,7 +241,8 @@ def prepare_large_prompt(messages, tools=None, tool_choice=None):
               else f"last msg itself > MAX_PROMPT_CHARS ({len(companion_prompt)} chars)")
     log(f"[bridge] large prompt: cannot split ({reason}), writing full prompt to file")
     fd, path = tempfile.mkstemp(suffix=".txt", prefix="qwen_prompt_")
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
+    full_prompt = _render_fit(messages, tools, tool_choice)
+    with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
         f.write(full_prompt)
 
     file_info = {

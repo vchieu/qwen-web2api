@@ -16,6 +16,11 @@ _TRUNCATION_MARKER = "[...truncated...]"
 
 
 def _stringify_content(content) -> str:
+    """Flatten content, chuan hoa CRLF/CR -> LF (client Windows lam phong prompt)."""
+    return _stringify_raw(content).replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _stringify_raw(content) -> str:
     if content is None:
         return ""
     if isinstance(content, str):
@@ -141,6 +146,11 @@ def _tool_use_block(tool_defs, constraint) -> str:
         "something -> output ONLY tool_call block(s); (B) you already have "
         "everything -> answer as plain text with NO block. Never both, and "
         "never any prose after the block.\n"
+        "- If the conversation's own instructions require every reply to use "
+        "a tool (for example an error such as \"You did not use a tool in "
+        "your previous response\"), do NOT answer in plain text: deliver the "
+        "final answer through the matching completion tool (for example "
+        "attempt_completion) as a tool_call block.\n"
         '- Every parameter belongs inside the "arguments" object, keyed '
         'exactly like the tool\'s "parameters" properties -- never beside '
         '"name".\n'
@@ -201,8 +211,9 @@ def _join_parts(parts, max_bytes, pinned_head=None) -> str:
     return "\n\n".join([_TRUNCATION_MARKER] + tail)
 
 
-def messages_to_prompt(messages, tools=None, tool_choice=None) -> str:
-    max_bytes = int(CONFIG.get("prompt_max_bytes", 262144))
+def messages_to_prompt(messages, tools=None, tool_choice=None,
+                       max_bytes=None) -> str:
+    max_bytes = int(max_bytes or CONFIG.get("prompt_max_bytes", 262144))
     parts, tool_block = [], None
     if tools and tool_choice != "none":
         defs = []

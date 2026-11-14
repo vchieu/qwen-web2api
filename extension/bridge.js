@@ -147,6 +147,18 @@
       || el.innerText || el.textContent || "").trim();
   }
 
+  // Text nhin thay cua element (khac textOf: textOf uu tien aria-label).
+  function visibleText(el) {
+    if (!el) return "";
+    return String(el.innerText || el.textContent || "").trim();
+  }
+
+  // Nut model picker co the mang aria-label co dinh ("Select Model") trong khi
+  // text hien thi la ten model dang chon -> doc text nhin thay truoc.
+  function triggerLabel(el) {
+    return visibleText(el) || textOf(el);
+  }
+
   function normLabel(s) {
     return String(s || "")
       .toLowerCase()
@@ -313,7 +325,7 @@
           message: "khong tim thay model picker de chon " + job.model });
         return false;
       }
-      const currentModelLabel = textOf(trigger);
+      const currentModelLabel = triggerLabel(trigger);
       if (labelMatches(targets, currentModelLabel)) {
         debugLog("selectModel: already on correct model:", currentModelLabel);
         return true;
@@ -346,10 +358,11 @@
       }
       best.click();
       await sleep(600);
-      const ok = labelMatches(targets, textOf(trigger));
+      const ok = labelMatches(targets, triggerLabel(trigger));
       if (!ok) {
         send(job.id, { kind: "warn",
-          message: "UI chua hien model " + job.model + " sau khi chon (hien tai: '" + textOf(trigger) + "')" });
+          message: "UI chua hien model " + job.model + " sau khi chon (hien tai: '"
+            + triggerLabel(trigger) + "', aria-label: '" + textOf(trigger) + "')" });
       }
       return ok;
     } catch (e) {
@@ -359,12 +372,15 @@
     }
   }
 
-  function isTemporaryPage() {
+  // strict=true (dang muon che do thuong): chi tin URL/cache, khong tin DOM/text
+  // (nut toggle "temporary chat" luon hien o che do thuong -> false positive).
+  function isTemporaryPage(strict) {
     if (pageLoadedAsTemporary) return true;
     if (/[?&]temporary-chat=true/.test(location.search) || /[?&]temporary-chat=true/.test(location.href)) {
       pageLoadedAsTemporary = true;
       return true;
     }
+    if (strict) return false;
     const tempEl = document.querySelector(
       '[class*="temporary" i], [data-testid*="temporary" i], [aria-label*="temporary" i], [title*="temporary" i]'
     );
@@ -375,6 +391,27 @@
       return true;
     }
     return false;
+  }
+
+  // Chan doan temporary mode: cho thay tin hieu nao dang dung (url/dom/text/cache).
+  function temporaryEvidence() {
+    let domHit = false, textHit = false;
+    try {
+      const el = document.querySelector(
+        '[class*="temporary" i], [data-testid*="temporary" i], [aria-label*="temporary" i], [title*="temporary" i]'
+      );
+      domHit = !!(el && visible(el));
+    } catch (e) { /* best-effort */ }
+    try {
+      const bodyText = (document.body && document.body.innerText) || "";
+      textHit = /temporary\s*chat\s*(is\s*on|enabled|bật|đang\s*bật)|cuộc\s*trò\s*chuyện\s*tạm\s*thời|临时对话/i.test(bodyText);
+    } catch (e) { /* best-effort */ }
+    return {
+      url: /[?&]temporary-chat=true/.test(location.search)
+        || /[?&]temporary-chat=true/.test(location.href),
+      dom: domHit, text: textHit, cached: pageLoadedAsTemporary,
+      href: location.href,
+    };
   }
 
   function modeUrl(want) {
@@ -403,12 +440,12 @@
       const st = await readStatus();
       if (typeof st.temporary_chat !== "boolean") return true;
       const want = st.temporary_chat;
-      if (want === isTemporaryPage()) return true;
+      if (want === isTemporaryPage(!want)) return true;
       job.mode_retries = (job.mode_retries || 0) + 1;
       if (job.mode_retries > 2) {
         send(job.id, { kind: "warn",
           message: "khong doi duoc temporary_chat=" + want
-            + "; tiep tuc voi che do hien tai" });
+            + "; tiep tuc voi che do hien tai " + JSON.stringify(temporaryEvidence()) });
         return true;
       }
       try {
@@ -432,7 +469,7 @@
     try {
       const st = await readStatus();
       if (typeof st.temporary_chat !== "boolean") return true;
-      if (st.temporary_chat === isTemporaryPage()) {
+      if (st.temporary_chat === isTemporaryPage(!st.temporary_chat)) {
         try { sessionStorage.removeItem(MODE_NAV_KEY); } catch (e) { /* best-effort */ }
         return true;
       }
@@ -710,9 +747,55 @@
     settle(job, null);
   }
 
+  // Chan doan chinh xac: request completion cua app co kem file/attachment khong?
+  // (heuristic DOM co the bao sai). Chi doc body, khong sua request, khong throw.
+  async function inspectCompletionRequest(job, input, init) {
+    try {
+      let body = init && init.body;
+      if (typeof body !== "string" && input && typeof input.clone === "function") {
+        body = await input.clone().text();
+      }
+      if (typeof body !== "string" || !body) return;
+      const req = JSON.parse(body);
+      if (!req || typeof req !== "object") return;
+      const found = [];
+      const walk = (v, path, depth) => {
+        if (depth > 5 || v === null || typeof v !== "object") return;
+        if (Array.isArray(v)) {
+          v.slice(0, 50).forEach((x, i) => walk(x, path + "[" + i + "]", depth + 1));
+          return;
+        }
+        for (const k of Object.keys(v)) {
+          const val = v[k];
+          if (/^(files?|attachments?|file_ids?)$/i.test(k)
+              && Array.isArray(val) && val.length) {
+            found.push(path + "." + k + "=" + val.length);
+          }
+          walk(val, path + "." + k, depth + 1);
+        }
+      };
+      walk(req, "$", 0);
+      const msgs = Array.isArray(req.messages) ? req.messages : [];
+      const chars = msgs.reduce((n, m) => n + partsText(m && m.content).length, 0);
+      const last = msgs.length ? msgs[msgs.length - 1] : null;
+      const info = "completion request: keys=" + Object.keys(req).join(",")
+        + " messages=" + msgs.length + " content_chars=" + chars
+        + " last_msg_keys=" + (last && typeof last === "object" ? Object.keys(last).join(",") : "-")
+        + " attachments=[" + found.join(", ") + "]";
+      const missing = !!(job && job.file_info) && !found.length;
+      send(job.id, { kind: missing ? "warn" : "debug",
+        message: missing ? "request gui di KHONG thay file/attachment: " + info : info });
+    } catch (e) {
+      debugLog("inspectCompletionRequest skipped:", (e && e.message) || e);
+    }
+  }
+
   // Hook fetch: bat response cua chinh app, khong can doc DOM.
   const origFetch = window.fetch;
   window.fetch = async function (input, init) {
+    if (current && !current.attached && isCompletionURL(urlOf(input))) {
+      inspectCompletionRequest(current, input, init);  // khong await: chi chan doan
+    }
     const resp = await origFetch.apply(this, arguments);
     try {
       if (current && !current.attached && isCompletionURL(urlOf(input))) {
@@ -721,7 +804,8 @@
           current._clearSendTimer();
         }
         const clone = resp.clone();
-        pumpFetch(current, clone).catch((e) => settle(current, e));
+        const jobRef = current;  // `current` co the da doi khi stream loi muon
+        pumpFetch(jobRef, clone).catch((e) => settle(jobRef, e));
       }
     } catch (e) { /* khong anh huong app */ }
     return resp;
@@ -881,6 +965,7 @@
       const label = (el.getAttribute("aria-label") || el.getAttribute("title")
         || el.getAttribute("data-testid") || el.textContent || "").toLowerCase();
       let score = 0;
+      if (/stop|cancel|abort|dừng/.test(label)) continue;  // khong bam nham nut Stop
       if (el.type === "submit") score += 3;
       if (rx.test(label)) score += 3;
       if (el.querySelector("svg")) score += 1;
@@ -1080,6 +1165,11 @@
   async function attachLongPrompt(composer, fileInfo, companionPrompt, job) {
     const promptText = companionPrompt || attachmentPrompt || ATTACHMENT_COMPANION_PROMPT;
     const text = await fetchPromptText(fileInfo);
+    if (job && fileInfo.size > 131072) {
+      send(job.id, { kind: "warn",
+        message: "file prompt " + fileInfo.size + " ky tu > 131072: Qwen se KHONG chuyen "
+          + "paste thanh file dinh kem (lich su se mat)" });
+    }
     const before = attachmentSnapshot();
 
     saveJobState(job, "pasting_file", "Pasting file: " + fileInfo.filename);
@@ -1176,12 +1266,17 @@
         }
       }
 
-      // Kiem tra co attachment_prompt nhung thieu pasted file
-      if (job && job.file_info) {
+      // Kiem tra co attachment_prompt nhung thieu pasted file. Heuristic DOM nay
+      // bao sai (log that: 12-17 canh bao/job du model van doc duoc file) nen chi
+      // canh bao 1 lan/job; bang chung chinh xac la dong 'completion request: ...'
+      // do inspectCompletionRequest gui ve.
+      if (job && job.file_info && !job._warnedNoAttach) {
         const hasAtt = findActiveAttachmentElements(composer).length > 0;
         const hasTxt = !!composerText(composer).trim();
         if (hasTxt && !hasAtt) {
-          const warnMsg = "CANH BAO NGUY HIEM: Composer co attachment_prompt ('" + composerText(composer).trim().slice(0, 40) + "...') nhung KHONG co pasted file / attachment card nao trong DOM truoc khi bam gui!";
+          job._warnedNoAttach = true;
+          const warnMsg = "CANH BAO: khong thay attachment card trong DOM truoc khi bam gui "
+            + "(heuristic, co the sai - xem dong 'completion request' de biet file co duoc gui that)";
           log(warnMsg);
           send(job.id, { kind: "warn", message: warnMsg });
         }
@@ -1219,6 +1314,8 @@
       if (!(await ensureMode(job))) return;
       await selectModel(job);
       saveJobState(job, "model_selected", "Model " + job.model);
+      send(job.id, { kind: "debug",
+        message: "temporary evidence: " + JSON.stringify(temporaryEvidence()) });
       const composer = await waitComposer();
       saveJobState(job, "composer_ready", "Composer found");
 
@@ -1289,13 +1386,14 @@
     console.log("send button:", c ? findSendButton(c) : null);
     console.log("active attachments:", findActiveAttachmentElements(c));
     console.log("has chat messages:", hasChatMessages());
-    console.log("temporary chat page:", isTemporaryPage());
+    console.log("temporary chat page:", isTemporaryPage(), temporaryEvidence());
     console.log("debug enabled:", debugEnabled);
     console.log("active job in sessionStorage:", sessionStorage.getItem(ACTIVE_JOB_KEY));
     console.log("known models:", knownModels, "select enabled:", selectModelEnabled);
     const trigger = findModelTrigger(
       knownModels.map((m) => m.id || "").filter(Boolean));
-    console.log("model trigger:", trigger, trigger ? textOf(trigger) : "");
+    console.log("model trigger:", trigger,
+      trigger ? { visible: visibleText(trigger), aria: textOf(trigger) } : "");
     console.log("last raw thinking deltas:", lastRawDeltas);
   };
 

@@ -110,6 +110,29 @@ Luồng chat: `do_POST` → `_handle_chat` / `_handle_responses` →
    - **Job mồ côi (orphan jobs)**: Python `/poll` tự động phát hiện và drop job hết hạn TTL hoặc job có caller
      đã ngắt kết nối (`managed=True` nhưng không còn trong `_jobs`), không chuyển job chết cho extension.
 
+6. Chẩn đoán gửi prompt (bridge_fix_patch): hook `window.fetch` còn đọc body request
+   completion của chính app (`inspectCompletionRequest`) và gửi event `debug`/`warn` kèm
+   số attachment thật — đây là bằng chứng chính xác file prompt dài có tới Qwen hay không;
+   heuristic DOM `findActiveAttachmentElements` có thể báo sai nên chỉ warn 1 lần/job.
+   `findSendButton` bỏ qua nút Stop. `selectModel` đọc text nhìn thấy của model picker
+   (`triggerLabel`) thay vì chỉ aria-label. Mỗi job gửi event debug
+   `temporary evidence: {url,dom,text,cached}` để thấy cache `pageLoadedAsTemporary` có lệch
+   URL/DOM không. Cache chủ ý KHÔNG bị reset mù quáng: reset khi URL mất `?temporary-chat=true`
+   có thể gây reload lặp nếu Qwen tự xoá param. `tools.py` rule (B) bảo model đưa final answer
+   qua completion tool (vd `attempt_completion`) khi client yêu cầu mỗi reply phải dùng tool.
+
+7. `isTemporaryPage(strict)`: khi config muốn chế độ thường (`temporary_chat=false`) chỉ tin
+   URL `?temporary-chat=true`/cache, không tin DOM/text (nút toggle "temporary chat" luôn hiện
+   ở chế độ thường → false positive → `location.assign("/")` lặp = tab reload liên tục).
+   Muốn temporary vẫn dùng heuristic lỏng (app tự xoá param vẫn không reload lặp).
+
+8. Giới hạn file prompt: Qwen chỉ chuyển text paste thành file đính kèm khi ≤ 131072 ký tự.
+   `prepare_large_prompt` cắt file lịch sử/prompt đầy đủ bằng `_render_fit` (`FILE_MAX_CHARS`=130000,
+   giữ đầu + tin mới nhất, chèn `[...truncated...]`); `messages_to_prompt(max_bytes=...)` ép trần
+   byte; CRLF được chuẩn hoá về LF (Windows text mode từng ghi `\r\r\n` làm phình file). File vượt
+   giới hạn thì paste không thành attachment, composer bị thay bằng companion prompt và MẤT lịch sử.
+   bridge.js gửi `warn` nếu `file_info.size` > 131072.
+
 ## Kiểm tra UI thủ công
 
 1. Load extension, mở tab chat.qwen.ai đã đăng nhập, chạy server.
